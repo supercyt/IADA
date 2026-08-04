@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "OpenCOOD"
+version = "0.1.0"
+description = "An open-source PyTorch framework for autonomous-driving cooperative detection"
+readme = "README.md"
+requires-python = ">=3.8,<3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "Yifan Lu" },
+    { name = "Runsheng Xu", email = "rxx3386@ucla.edu" },
+    { name = "Hao Xiang" },
+]
+dependencies = [
+    "cmake",
+    "cython",
+    "easydict",
+    "efficientnet-pytorch",
+    "einops",
+    "fvcore",
+    "h5py",
+    "icecream",
+    "numba",
+    "numpy",
+    "open3d",
+    "opencv-python-headless",
+    "pypcd @ git+https://github.com/klintan/pypcd.git",
+    "pyquaternion",
+    "pyyaml",
+    "python-lzf",
+    "scikit-image",
+    "scikit-learn",
+    "scipy",
+    "shapely",
+    "spconv-cu120",
+    "tensorboardX",
+    "termcolor",
+    "timm",
+    "torch==2.4.1",
+    "torchaudio==2.4.1",
+    "torchvision==0.19.1",
+    "tqdm",
+]
+
+[tool.setuptools.packages.find]
+include = ["opencood*"]
+
+[tool.uv]
+required-version = ">=0.5.0"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu121" }
+torchvision = { index = "pytorch-cu121" }
+torchaudio = { index = "pytorch-cu121" }
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
