@@ -25,7 +25,7 @@ dependencies = [
     "icecream",
     "numba",
     "numpy",
-    "open3d",
+    "open3d==0.18.0",
     "opencv-python-headless",
     "pypcd @ git+https://github.com/klintan/pypcd.git",
     "pyquaternion",
