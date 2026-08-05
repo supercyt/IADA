@@ -971,7 +971,7 @@ requires-dist = [
     { name = "numpy" },
     { name = "open3d", specifier = "==0.18.0" },
     { name = "opencv-python-headless" },
-    { name = "pypcd", git = "https://github.com/klintan/pypcd.git" },
+    { name = "pypcd", path = "vendor/pypcd-0.1.1-py3-none-any.whl" },
     { name = "pyquaternion" },
     { name = "python-lzf" },
     { name = "pyyaml" },
@@ -1198,8 +1198,17 @@ wheels = [
 [[package]]
 name = "pypcd"
 version = "0.1.1"
-source = { git = "https://github.com/klintan/pypcd.git#796e545df2ee5e7836df6fe2f274aae3428d1ac2" }
+source = { path = "vendor/pypcd-0.1.1-py3-none-any.whl" }
 dependencies = [
+    { name = "numpy" },
+    { name = "python-lzf" },
+]
+wheels = [
+    { filename = "pypcd-0.1.1-py3-none-any.whl", hash = "sha256:9a3b8a7333b81860a32a5e2fdedb7888578c001349d9069ee0e3e08a264f1e30" },
+]
+
+[package.metadata]
+requires-dist = [
     { name = "numpy" },
     { name = "python-lzf" },
 ]

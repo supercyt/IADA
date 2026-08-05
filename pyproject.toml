@@ -27,7 +27,7 @@ dependencies = [
     "numpy",
     "open3d==0.18.0",
     "opencv-python-headless",
-    "pypcd @ git+https://github.com/klintan/pypcd.git",
+    "pypcd",
     "pyquaternion",
     "pyyaml",
     "python-lzf",
@@ -55,6 +55,7 @@ required-version = ">=0.5.0"
 torch = { index = "pytorch-cu121" }
 torchvision = { index = "pytorch-cu121" }
 torchaudio = { index = "pytorch-cu121" }
+pypcd = { path = "vendor/pypcd-0.1.1-py3-none-any.whl" }
 
 [[tool.uv.index]]
 name = "pytorch-cu121"
