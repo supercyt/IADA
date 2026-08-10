@@ -483,12 +483,25 @@ class CollaborativeKnowledgeTransfer(nn.Module):
                     self.spatial_norms[index](channel_last)
                 )
             ).permute(0, 3, 1, 2)
-            reconstructed_slices.append(
-                torch.channel_shuffle(
-                    ego_slice * channel_context * spatial_context,
-                    self.shuffle_groups,
-                )
+            reconstructed_slice = (
+                ego_slice * channel_context * spatial_context
             )
+            batch_size, channels, height, width = (
+                reconstructed_slice.shape
+            )
+            reconstructed_slice = (
+                reconstructed_slice.reshape(
+                    batch_size,
+                    self.shuffle_groups,
+                    channels // self.shuffle_groups,
+                    height,
+                    width,
+                )
+                .transpose(1, 2)
+                .contiguous()
+                .reshape(batch_size, channels, height, width)
+            )
+            reconstructed_slices.append(reconstructed_slice)
         reconstructed = torch.cat(reconstructed_slices, dim=1)
         return reconstructed
 
