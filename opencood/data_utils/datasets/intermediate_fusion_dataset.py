@@ -30,6 +30,38 @@ from opencood.utils.pcd_utils import (
 from opencood.utils.common_utils import read_json
 
 
+def sample_scene_augmentation(augment_config, train):
+    """Sample one geometric transform shared by every CAV in a scene."""
+
+    if not train:
+        return None
+    parameters = {
+        'flip': {},
+        'noise_rotation': None,
+        'noise_scale': None,
+    }
+    for config in augment_config:
+        name = config['NAME']
+        if name == 'random_world_flip':
+            for axis in config['ALONG_AXIS_LIST']:
+                parameters['flip'][axis] = bool(np.random.choice(
+                    [False, True], replace=False, p=[0.5, 0.5]
+                ))
+        elif name == 'random_world_rotation':
+            rotation_range = config['WORLD_ROT_ANGLE']
+            if not isinstance(rotation_range, list):
+                rotation_range = [-rotation_range, rotation_range]
+            parameters['noise_rotation'] = float(np.random.uniform(
+                rotation_range[0], rotation_range[1]
+            ))
+        elif name == 'random_world_scaling':
+            scale_range = config['WORLD_SCALE_RANGE']
+            parameters['noise_scale'] = float(np.random.uniform(
+                scale_range[0], scale_range[1]
+            ))
+    return parameters
+
+
 def getIntermediateFusionDataset(cls):
     """
     cls: the Basedataset.
@@ -58,7 +90,9 @@ def getIntermediateFusionDataset(cls):
 
 
 
-        def get_item_single_car(self, selected_cav_base, ego_cav_base):
+        def get_item_single_car(
+                self, selected_cav_base, ego_cav_base,
+                scene_augmentation=None):
             """
             Process a single CAV's information for the train/test pipeline.
 
@@ -88,6 +122,18 @@ def getIntermediateFusionDataset(cls):
             transformation_matrix_clean = \
                 x1_to_x2(selected_cav_base['params']['lidar_pose_clean'],
                         ego_pose_clean)
+
+            # Generate labels before preprocessing so the exact same sampled
+            # world transform can be applied to points and boxes.
+            single_object_bbx_center, single_object_bbx_mask, _ = \
+                self.generate_object_center(
+                    [selected_cav_base],
+                    selected_cav_base['params']['lidar_pose']
+                )
+            object_bbx_center, object_bbx_mask, object_ids = \
+                self.generate_object_center(
+                    [selected_cav_base], ego_pose_clean
+                )
             
             # lidar
             if self.load_lidar_file or self.visualize:
@@ -104,6 +150,47 @@ def getIntermediateFusionDataset(cls):
                 if self.proj_first:
                     lidar_np[:, :3] = projected_lidar
 
+                if scene_augmentation is not None:
+                    augmentation_dict = {
+                        'lidar_np': lidar_np,
+                        'object_bbx_center': object_bbx_center,
+                        'object_bbx_mask': object_bbx_mask,
+                        **scene_augmentation,
+                    }
+                    augmentation_dict = self.data_augmentor.forward(
+                        augmentation_dict
+                    )
+                    lidar_np = augmentation_dict['lidar_np']
+                    object_bbx_center = augmentation_dict[
+                        'object_bbx_center'
+                    ]
+                    object_bbx_mask = augmentation_dict['object_bbx_mask']
+
+                    single_augmentation_dict = {
+                        'lidar_np': np.empty((0, lidar_np.shape[1]),
+                                             dtype=lidar_np.dtype),
+                        'object_bbx_center': single_object_bbx_center,
+                        'object_bbx_mask': single_object_bbx_mask,
+                        **scene_augmentation,
+                    }
+                    single_augmentation_dict = self.data_augmentor.forward(
+                        single_augmentation_dict
+                    )
+                    single_object_bbx_center = single_augmentation_dict[
+                        'object_bbx_center'
+                    ]
+                    single_object_bbx_mask = single_augmentation_dict[
+                        'object_bbx_mask'
+                    ]
+
+                    if self.proj_first:
+                        projected_lidar = lidar_np[:, :3]
+                    else:
+                        projected_lidar = \
+                            box_utils.project_points_by_matrix_torch(
+                                lidar_np[:, :3], transformation_matrix
+                            )
+
                 if self.visualize:
                     # filter lidar
                     selected_cav_processed.update({'projected_lidar': projected_lidar})
@@ -118,16 +205,15 @@ def getIntermediateFusionDataset(cls):
                 selected_cav_processed.update({'processed_features': processed_lidar})
 
             # generate targets label single GT, note the reference pose is itself.
-            object_bbx_center, object_bbx_mask, object_ids = self.generate_object_center(
-                [selected_cav_base], selected_cav_base['params']['lidar_pose']
-            )
             label_dict = self.post_processor.generate_label(
-                gt_box_center=object_bbx_center, anchors=self.anchor_box, mask=object_bbx_mask
+                gt_box_center=single_object_bbx_center,
+                anchors=self.anchor_box,
+                mask=single_object_bbx_mask
             )
             selected_cav_processed.update({
                                 "single_label_dict": label_dict,
-                                "single_object_bbx_center": object_bbx_center,
-                                "single_object_bbx_mask": object_bbx_mask})
+                                "single_object_bbx_center": single_object_bbx_center,
+                                "single_object_bbx_mask": single_object_bbx_mask})
 
             # camera
             if self.load_camera_file:
@@ -216,10 +302,6 @@ def getIntermediateFusionDataset(cls):
             # anchor box
             selected_cav_processed.update({"anchor_box": self.anchor_box})
 
-            # note the reference pose ego
-            object_bbx_center, object_bbx_mask, object_ids = self.generate_object_center([selected_cav_base],
-                                                        ego_pose_clean)
-
             selected_cav_processed.update(
                 {
                     "object_bbx_center": object_bbx_center[object_bbx_mask == 1],
@@ -236,6 +318,9 @@ def getIntermediateFusionDataset(cls):
         def __getitem__(self, idx):
             base_data_dict = self.retrieve_base_data(idx)
             base_data_dict = add_noise_data_dict(base_data_dict,self.params['noise_setting'])
+            scene_augmentation = sample_scene_augmentation(
+                self.params.get('data_augment', []), self.train
+            )
 
             processed_data_dict = OrderedDict()
             processed_data_dict['ego'] = {}
@@ -345,7 +430,8 @@ def getIntermediateFusionDataset(cls):
                 selected_cav_base = base_data_dict[cav_id]
                 selected_cav_processed = self.get_item_single_car(
                     selected_cav_base,
-                    ego_cav_base)
+                    ego_cav_base,
+                    scene_augmentation)
                     
                 object_stack.append(selected_cav_processed['object_bbx_center'])
                 object_id_stack += selected_cav_processed['object_ids']
@@ -633,5 +719,4 @@ def getIntermediateFusionDataset(cls):
 
 
     return IntermediateFusionDataset
-
 

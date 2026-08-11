@@ -25,7 +25,6 @@ from opencood.tools.sim2real_utils import (
     ForeverDataIterator,
     build_prior_encoding,
     build_source_config,
-    merge_source_target_batches,
 )
 
 
@@ -37,6 +36,12 @@ MODEL_INPUT_KEYS = (
     "lidar_pose",
 )
 TRAINING_STATE_FILENAME = "training_state_latest.pth"
+SCENE_INDEX_OUTPUT_KEYS = {
+    "domain_scene_index",
+    "agent_scene_index",
+    "ssda_global_scene_index",
+    "ssda_local_scene_index",
+}
 
 
 def _atomic_torch_save(value, destination):
@@ -142,6 +147,9 @@ def _adaptation_protocol_signature(hypes):
         "noise_setting": hypes.get("noise_setting"),
         "input_source": hypes.get("input_source"),
         "label_type": hypes.get("label_type"),
+        # DAIRV2XBaseDataset defaults missing legacy configs to the official
+        # DUSA car-only protocol.  An explicit false remains a protocol change.
+        "car_only": hypes.get("car_only", True),
     }
     return _canonical_config_value(signature)
 
@@ -523,7 +531,7 @@ def _set_random_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def _select_model_inputs(ego_batch):
+def _select_model_inputs(ego_batch, domain="source"):
     missing = [key for key in MODEL_INPUT_KEYS if key not in ego_batch]
     if missing:
         raise KeyError(f"Batch is missing model inputs: {missing}")
@@ -531,10 +539,49 @@ def _select_model_inputs(ego_batch):
     # Source-only baseline/validation must not infer infrastructure from local
     # index 1: OPV2V collaborators are all vehicles. An existing prior is
     # validated by build_prior_encoding instead of being silently trusted.
-    model_inputs["prior_encoding"] = build_prior_encoding(
-        ego_batch, "source"
-    )
+    model_inputs["prior_encoding"] = build_prior_encoding(ego_batch, domain)
     return model_inputs
+
+
+def _merge_domain_outputs(
+    source_output, target_output, source_scene_count
+):
+    """Join adapter tensors from independent source/target forwards.
+
+    Keeping the detector forwards independent prevents source and target
+    samples from sharing BatchNorm statistics.  Scene indices produced by the
+    target forward are local to that mini-batch, so they are shifted before
+    the adaptation loss sees the combined domain batch.
+    """
+
+    source_keys = set(source_output) - set(DETECTION_OUTPUT_KEYS)
+    target_keys = set(target_output) - set(DETECTION_OUTPUT_KEYS)
+    if source_keys != target_keys:
+        raise KeyError(
+            "Source and target adapter outputs differ: "
+            f"source-only={sorted(source_keys - target_keys)}, "
+            f"target-only={sorted(target_keys - source_keys)}"
+        )
+    if not source_keys:
+        raise KeyError("Domain adaptation model produced no adapter outputs")
+
+    merged = {}
+    for key in source_keys:
+        source_value = source_output[key]
+        target_value = target_output[key]
+        if not torch.is_tensor(source_value) or not torch.is_tensor(
+            target_value
+        ):
+            raise TypeError(f"Adapter output {key!r} must be a tensor")
+        if key in SCENE_INDEX_OUTPUT_KEYS:
+            target_value = target_value + int(source_scene_count)
+        try:
+            merged[key] = torch.cat((source_value, target_value), dim=0)
+        except RuntimeError as error:
+            raise ValueError(
+                f"Cannot concatenate source/target adapter output {key!r}"
+            ) from error
+    return merged
 
 
 def _slice_detection_output(output_dict, source_scene_count):
@@ -945,13 +992,27 @@ def main():
                 target_batch = next(target_iterator)
                 if target_batch is None:
                     continue
-                model_inputs, source_scene_count, domain_labels = (
-                    merge_source_target_batches(
-                        source_ego, target_batch["ego"]
+                target_ego = target_batch["ego"]
+                source_model_inputs = _select_model_inputs(
+                    source_ego, "source"
+                )
+                target_model_inputs = _select_model_inputs(
+                    target_ego, "target"
+                )
+                source_scene_count = int(
+                    source_ego["record_len"].numel()
+                )
+                target_scene_count = int(
+                    target_ego["record_len"].numel()
+                )
+                domain_labels = torch.cat(
+                    (
+                        torch.zeros(source_scene_count),
+                        torch.ones(target_scene_count),
                     )
                 )
             else:
-                model_inputs = _select_model_inputs(source_ego)
+                source_model_inputs = _select_model_inputs(source_ego)
                 source_scene_count = int(
                     source_ego["record_len"].numel()
                 )
@@ -969,8 +1030,15 @@ def main():
                 else 0.0
             )
 
-            model_inputs = train_utils.to_device(model_inputs, device)
-            model_inputs["grl_lambda"] = current_grl
+            source_model_inputs = train_utils.to_device(
+                source_model_inputs, device
+            )
+            source_model_inputs["grl_lambda"] = current_grl
+            if use_target:
+                target_model_inputs = train_utils.to_device(
+                    target_model_inputs, device
+                )
+                target_model_inputs["grl_lambda"] = current_grl
             source_label_dict = train_utils.to_device(
                 source_ego["label_dict"], device
             )
@@ -979,22 +1047,34 @@ def main():
 
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=amp_enabled):
-                output_dict = model(model_inputs)
+                source_output = model(source_model_inputs)
                 detection_output = _slice_detection_output(
-                    output_dict, source_scene_count
+                    source_output, source_scene_count
                 )
                 detection_loss = criterion(
                     detection_output, source_label_dict
                 )
 
                 if use_target:
+                    target_output = model(target_model_inputs)
+                    output_dict = _merge_domain_outputs(
+                        source_output,
+                        target_output,
+                        source_scene_count,
+                    )
+                    record_len = torch.cat(
+                        (
+                            source_model_inputs["record_len"],
+                            target_model_inputs["record_len"],
+                        )
+                    )
                     adaptation_loss, adaptation_metrics = (
                         compute_adaptation_loss(
                             stage,
                             output_dict,
                             domain_labels,
                             source_scene_count,
-                            model_inputs["record_len"],
+                            record_len,
                             source_label_dict,
                             da_cfg,
                         )

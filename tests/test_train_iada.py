@@ -20,6 +20,7 @@ from opencood.tools.train_iada import (
     _grl_lambda,
     _load_model_checkpoint,
     _load_training_state,
+    _merge_domain_outputs,
     _resolve_best_validation_path,
     _restore_random_state,
     _save_training_state,
@@ -102,6 +103,7 @@ def _protocol_hypes(stage):
         "noise_setting": {"add_noise": False},
         "input_source": ["lidar"],
         "label_type": "lidar",
+        "car_only": True,
     }
 
 
@@ -292,6 +294,49 @@ class DetectionSliceTest(unittest.TestCase):
         self.assertNotIn("domain_logits", source_output)
 
 
+class SeparateDomainForwardTest(unittest.TestCase):
+    def test_merges_adapter_outputs_and_offsets_target_scene_indices(self):
+        source_logits = torch.tensor([[1.0], [2.0]], requires_grad=True)
+        target_logits = torch.tensor([[3.0]], requires_grad=True)
+        source = {
+            "cls_preds": torch.zeros(2, 1, 1, 1),
+            "reg_preds": torch.zeros(2, 2, 1, 1),
+            "domain_logits": source_logits,
+            "domain_scene_index": torch.tensor([0, 1]),
+            "domain_valid_mask": torch.tensor([True, True]),
+            "agent_scene_index": torch.tensor([0, 0, 1]),
+            "agent_local_index": torch.tensor([0, 1, 0]),
+        }
+        target = {
+            "cls_preds": torch.zeros(1, 1, 1, 1),
+            "reg_preds": torch.zeros(1, 2, 1, 1),
+            "domain_logits": target_logits,
+            "domain_scene_index": torch.tensor([0]),
+            "domain_valid_mask": torch.tensor([True]),
+            "agent_scene_index": torch.tensor([0, 0]),
+            "agent_local_index": torch.tensor([0, 1]),
+        }
+
+        merged = _merge_domain_outputs(source, target, 2)
+
+        torch.testing.assert_close(
+            merged["domain_scene_index"], torch.tensor([0, 1, 2])
+        )
+        torch.testing.assert_close(
+            merged["agent_scene_index"], torch.tensor([0, 0, 1, 2, 2])
+        )
+        torch.testing.assert_close(
+            merged["agent_local_index"], torch.tensor([0, 1, 0, 0, 1])
+        )
+        merged["domain_logits"].sum().backward()
+        torch.testing.assert_close(
+            source_logits.grad, torch.ones_like(source_logits)
+        )
+        torch.testing.assert_close(
+            target_logits.grad, torch.ones_like(target_logits)
+        )
+
+
 class ModelInputSelectionTest(unittest.TestCase):
     def test_source_only_input_has_explicit_zero_prior(self):
         ego_batch = {
@@ -325,6 +370,24 @@ class ModelInputSelectionTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "canonical Sim2Real"):
             _select_model_inputs(ego_batch)
+
+    def test_target_input_marks_only_local_index_one_as_infrastructure(self):
+        ego_batch = {
+            "processed_lidar": {"sentinel": torch.tensor(1)},
+            "record_len": torch.tensor([2, 1]),
+            "pairwise_t_matrix": torch.eye(4).view(
+                1, 1, 1, 4, 4
+            ).repeat(2, 2, 2, 1, 1),
+            "lidar_pose": torch.zeros(3, 6),
+        }
+
+        model_inputs = _select_model_inputs(ego_batch, "target")
+
+        expected = torch.zeros(2, 2, 3)
+        expected[0, 1, 2] = 1.0
+        torch.testing.assert_close(
+            model_inputs["prior_encoding"], expected
+        )
 
 
 class GradientScheduleTest(unittest.TestCase):
@@ -504,6 +567,33 @@ class CheckpointCompatibilityTest(unittest.TestCase):
                 yaml.safe_dump(baseline, stream)
             with self.assertRaisesRegex(ValueError, "ROI"):
                 _validate_baseline_warm_start(directory, current)
+
+    def test_car_only_is_part_of_the_adaptation_protocol(self):
+        baseline = _protocol_hypes("baseline")
+        current = _protocol_hypes("iada")
+        baseline["car_only"] = False
+
+        with tempfile.TemporaryDirectory() as directory:
+            with open(
+                os.path.join(directory, "config.yaml"), "w"
+            ) as stream:
+                yaml.safe_dump(baseline, stream)
+
+            with self.assertRaisesRegex(ValueError, "same OPV2V source"):
+                _validate_baseline_warm_start(directory, current)
+
+    def test_legacy_config_defaults_to_car_only_protocol(self):
+        baseline = _protocol_hypes("baseline")
+        current = _protocol_hypes("iada")
+        baseline.pop("car_only")
+
+        with tempfile.TemporaryDirectory() as directory:
+            with open(
+                os.path.join(directory, "config.yaml"), "w"
+            ) as stream:
+                yaml.safe_dump(baseline, stream)
+
+            _validate_baseline_warm_start(directory, current)
 
     def test_adaptation_rejects_another_adaptation_as_warm_start(self):
         current = _protocol_hypes("iada")

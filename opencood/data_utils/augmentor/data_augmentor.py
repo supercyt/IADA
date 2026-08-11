@@ -43,12 +43,19 @@ class DataAugmentor(object):
                                     data_dict['object_bbx_mask'], \
                                     data_dict['lidar_np']
         gt_boxes_valid = gt_boxes[gt_mask == 1]
+        fixed_flips = data_dict.get('flip')
 
-        for cur_axis in config['ALONG_AXIS_LIST']:
+        for index, cur_axis in enumerate(config['ALONG_AXIS_LIST']):
             assert cur_axis in ['x', 'y']
+            if isinstance(fixed_flips, dict):
+                enable = fixed_flips.get(cur_axis)
+            elif fixed_flips is not None:
+                enable = fixed_flips[index]
+            else:
+                enable = None
             gt_boxes_valid, points = getattr(augment_utils,
                                              'random_flip_along_%s' % cur_axis)(
-                gt_boxes_valid, points,
+                gt_boxes_valid, points, enable,
             )
 
         gt_boxes[:gt_boxes_valid.shape[0], :] = gt_boxes_valid
@@ -72,7 +79,10 @@ class DataAugmentor(object):
                                     data_dict['lidar_np']
         gt_boxes_valid = gt_boxes[gt_mask == 1]
         gt_boxes_valid, points = augment_utils.global_rotation(
-            gt_boxes_valid, points, rot_range=rot_range
+            gt_boxes_valid,
+            points,
+            rot_range=rot_range,
+            noise_rotation=data_dict.get('noise_rotation'),
         )
         gt_boxes[:gt_boxes_valid.shape[0], :] = gt_boxes_valid
 
@@ -92,7 +102,10 @@ class DataAugmentor(object):
         gt_boxes_valid = gt_boxes[gt_mask == 1]
 
         gt_boxes_valid, points = augment_utils.global_scaling(
-            gt_boxes_valid, points, config['WORLD_SCALE_RANGE']
+            gt_boxes_valid,
+            points,
+            config['WORLD_SCALE_RANGE'],
+            noise_scale=data_dict.get('noise_scale'),
         )
         gt_boxes[:gt_boxes_valid.shape[0], :] = gt_boxes_valid
 

@@ -19,6 +19,19 @@ from opencood.utils.transformation_utils import inf_side_rot_and_trans_to_trasnf
 from opencood.data_utils.pre_processor import build_preprocessor
 from opencood.data_utils.post_processor import build_postprocessor
 
+
+def _filter_dair_labels(objects, car_only):
+    """Return the DAIR labels used by the configured detection protocol."""
+
+    if not car_only:
+        return objects
+    return [
+        object_content
+        for object_content in objects
+        if str(object_content.get('type', '')).lower() == 'car'
+    ]
+
+
 class DAIRV2XBaseDataset(Dataset):
     def __init__(self, params, visualize, train=True):
         self.params = params
@@ -30,6 +43,10 @@ class DAIRV2XBaseDataset(Dataset):
         self.post_processor.generate_gt_bbx = self.post_processor.generate_gt_bbx_by_iou
         self.data_augmentor = DataAugmentor(params['data_augment'],
                                             train)
+        # Official DUSA evaluates DAIR-V2X on Car only.  Keep this as the
+        # default so old saved configs without the new key are also evaluated
+        # with the paper protocol; users must opt out explicitly.
+        self.car_only = bool(params.get('car_only', True))
 
         if 'clip_pc' in params['fusion']['args'] and params['fusion']['args']['clip_pc']:
             self.clip_pc = True
@@ -115,8 +132,21 @@ class DAIRV2XBaseDataset(Dataset):
         transformation_matrix = inf_side_rot_and_trans_to_trasnformation_matrix(virtuallidar_to_world, system_error_offset)
         data[1]['params']['lidar_pose'] = tfm_to_pose(transformation_matrix)
 
-        data[0]['params']['vehicles_front'] = read_json(os.path.join(self.root_dir,frame_info['cooperative_label_path'].replace("label_world", "label_world_backup"))) 
-        data[0]['params']['vehicles_all'] = read_json(os.path.join(self.root_dir,frame_info['cooperative_label_path'])) 
+        data[0]['params']['vehicles_front'] = _filter_dair_labels(
+            read_json(os.path.join(
+                self.root_dir,
+                frame_info['cooperative_label_path'].replace(
+                    "label_world", "label_world_backup"
+                ),
+            )),
+            self.car_only,
+        )
+        data[0]['params']['vehicles_all'] = _filter_dair_labels(
+            read_json(os.path.join(
+                self.root_dir, frame_info['cooperative_label_path']
+            )),
+            self.car_only,
+        )
 
         data[1]['params']['vehicles_front'] = [] # we only load cooperative label in vehicle side
         data[1]['params']['vehicles_all'] = [] # we only load cooperative label in vehicle side
@@ -143,14 +173,40 @@ class DAIRV2XBaseDataset(Dataset):
 
 
         # Label for single side
-        data[0]['params']['vehicles_single_front'] = read_json(os.path.join(self.root_dir, \
-                                'vehicle-side/label/lidar_backup/{}.json'.format(veh_frame_id)))
-        data[0]['params']['vehicles_single_all'] = read_json(os.path.join(self.root_dir, \
-                                'vehicle-side/label/lidar/{}.json'.format(veh_frame_id)))
-        data[1]['params']['vehicles_single_front'] = read_json(os.path.join(self.root_dir, \
-                                'infrastructure-side/label/virtuallidar/{}.json'.format(inf_frame_id)))
-        data[1]['params']['vehicles_single_all'] = read_json(os.path.join(self.root_dir, \
-                                'infrastructure-side/label/virtuallidar/{}.json'.format(inf_frame_id)))
+        data[0]['params']['vehicles_single_front'] = _filter_dair_labels(
+            read_json(os.path.join(
+                self.root_dir,
+                'vehicle-side/label/lidar_backup/{}.json'.format(
+                    veh_frame_id
+                ),
+            )),
+            self.car_only,
+        )
+        data[0]['params']['vehicles_single_all'] = _filter_dair_labels(
+            read_json(os.path.join(
+                self.root_dir,
+                'vehicle-side/label/lidar/{}.json'.format(veh_frame_id),
+            )),
+            self.car_only,
+        )
+        data[1]['params']['vehicles_single_front'] = _filter_dair_labels(
+            read_json(os.path.join(
+                self.root_dir,
+                'infrastructure-side/label/virtuallidar/{}.json'.format(
+                    inf_frame_id
+                ),
+            )),
+            self.car_only,
+        )
+        data[1]['params']['vehicles_single_all'] = _filter_dair_labels(
+            read_json(os.path.join(
+                self.root_dir,
+                'infrastructure-side/label/virtuallidar/{}.json'.format(
+                    inf_frame_id
+                ),
+            )),
+            self.car_only,
+        )
 
 
         return data
