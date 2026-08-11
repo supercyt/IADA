@@ -98,6 +98,92 @@ def balanced_domain_loss(
     )
 
 
+def entropy_weighted_domain_loss(
+    domain_logits: torch.Tensor,
+    attention: torch.Tensor,
+    domain_labels: torch.Tensor,
+    scene_indices: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """Domain-balanced BCE weighted by an SSDA entropy attention map."""
+
+    if domain_logits.ndim == 0 or domain_logits.shape[0] == 0:
+        raise ValueError("domain_logits must have a non-empty batch dimension")
+    labels = domain_labels.reshape(-1).to(
+        device=domain_logits.device, dtype=domain_logits.dtype
+    )
+    if scene_indices is None:
+        if domain_logits.shape[0] != labels.numel():
+            raise ValueError(
+                "scene_indices are required when logits are not scene-aligned"
+            )
+        scene_indices = torch.arange(
+            labels.numel(), device=domain_logits.device
+        )
+    else:
+        scene_indices = scene_indices.reshape(-1).to(
+            device=domain_logits.device, dtype=torch.long
+        )
+    if scene_indices.numel() != domain_logits.shape[0]:
+        raise ValueError("scene_indices must match the first logit dimension")
+    if bool((scene_indices < 0).any().item()) or bool(
+        (scene_indices >= labels.numel()).any().item()
+    ):
+        raise ValueError("scene_indices contain an out-of-range scene")
+
+    label_shape = (domain_logits.shape[0],) + (1,) * (
+        domain_logits.ndim - 1
+    )
+    element_labels = labels[scene_indices].reshape(label_shape).expand_as(
+        domain_logits
+    )
+    weights = attention.to(
+        device=domain_logits.device, dtype=domain_logits.dtype
+    )
+    try:
+        weights = weights.expand_as(domain_logits)
+    except RuntimeError as error:
+        raise ValueError(
+            "attention is not broadcastable to domain_logits"
+        ) from error
+    if bool((weights < 0).any().item()):
+        raise ValueError("SSDA attention weights must be non-negative")
+
+    per_element = F.binary_cross_entropy_with_logits(
+        domain_logits, element_labels, reduction="none"
+    )
+    predictions = (domain_logits >= 0).to(element_labels.dtype)
+    losses = []
+    accuracies = []
+    valid_count = 0
+    for domain_value in (0.0, 1.0):
+        selected = element_labels == domain_value
+        selected_count = int(selected.sum().item())
+        valid_count += selected_count
+        if not selected_count:
+            continue
+        selected_weights = weights[selected]
+        denominator = selected_weights.sum()
+        if float(denominator.detach().item()) <= 0:
+            continue
+        losses.append(
+            (per_element[selected] * selected_weights).sum() / denominator
+        )
+        accuracies.append(
+            (
+                (predictions[selected] == element_labels[selected]).to(
+                    selected_weights.dtype
+                )
+                * selected_weights
+            ).sum()
+            / denominator
+        )
+
+    if len(losses) != 2:
+        zero = domain_logits.sum() * 0.0
+        return zero, domain_logits.new_tensor(float("nan")), valid_count
+    return torch.stack(losses).mean(), torch.stack(accuracies).mean(), valid_count
+
+
 def graph_variance_floor_loss(
     graph_embedding: torch.Tensor,
     valid_graph_mask: torch.Tensor,
@@ -418,6 +504,41 @@ def compute_adaptation_loss(
             metrics,
         )
 
+    if method == "ssda":
+        global_loss, global_accuracy, global_count = (
+            entropy_weighted_domain_loss(
+                output_dict["ssda_global_logits"],
+                output_dict["ssda_global_attention"],
+                domain_labels,
+                output_dict.get("ssda_global_scene_index"),
+            )
+        )
+        local_loss, local_accuracy, local_count = (
+            entropy_weighted_domain_loss(
+                output_dict["ssda_local_logits"],
+                output_dict["ssda_local_attention"],
+                domain_labels,
+                output_dict.get("ssda_local_scene_index"),
+            )
+        )
+        metrics.update(
+            domain_loss=global_loss + local_loss,
+            domain_accuracy=torch.stack(
+                (global_accuracy, local_accuracy)
+            ).nanmean(),
+            ssda_global_loss=global_loss,
+            ssda_global_accuracy=global_accuracy,
+            ssda_global_valid_count=global_loss.new_tensor(global_count),
+            ssda_local_loss=local_loss,
+            ssda_local_accuracy=local_accuracy,
+            ssda_local_valid_count=local_loss.new_tensor(local_count),
+        )
+        return (
+            float(config.get("ssda_global_weight", 0.5)) * global_loss
+            + float(config.get("ssda_local_weight", 1.0)) * local_loss,
+            metrics,
+        )
+
     raise ValueError(f"Unsupported domain adaptation method: {method!r}")
 
 
@@ -426,5 +547,6 @@ __all__ = [
     "compute_adaptation_loss",
     "cudax_bin_loss",
     "dusa_agent_loss",
+    "entropy_weighted_domain_loss",
     "graph_variance_floor_loss",
 ]

@@ -12,6 +12,7 @@ from opencood.loss.domain_adaptation_loss import (
     compute_adaptation_loss,
     cudax_bin_loss,
     dusa_agent_loss,
+    entropy_weighted_domain_loss,
 )
 from opencood.tools.compute_cudax_bounds import (
     compute_source_residual_bounds,
@@ -21,8 +22,11 @@ from opencood.models.fuse_modules.fusion_in_one import V2XViTFusion
 from opencood.models.sub_modules.domain_adaptation import (
     CUDAXAdapter,
     DUSAAdapter,
+    FrequencyShiftAdjustment,
+    HaarWaveletReconstruction,
     IADAAdapter,
     NaiveDomainAdapter,
+    SSDAAdapter,
     build_domain_adapter,
     extract_ego_features,
     scene_and_local_indices,
@@ -118,6 +122,14 @@ class AdapterFactoryTest(unittest.TestCase):
                 },
                 CUDAXAdapter,
             ),
+            (
+                {
+                    "enabled": True,
+                    "method": "ssda",
+                    "ssda_hidden_dim": 4,
+                },
+                SSDAAdapter,
+            ),
         )
         for config, expected_type in cases:
             with self.subTest(method=config["method"]):
@@ -140,6 +152,26 @@ class AdapterFactoryTest(unittest.TestCase):
 
 
 class AdapterForwardTest(unittest.TestCase):
+    def test_haar_reconstructed_bands_sum_to_original_feature(self):
+        features = torch.randn(2, 3, 5, 7)
+
+        bands = HaarWaveletReconstruction()(features)
+
+        self.assertEqual(bands.shape, (2, 12, 5, 7))
+        reconstructed = bands.reshape(2, 4, 3, 5, 7).sum(dim=1)
+        torch.testing.assert_close(reconstructed, features)
+
+    def test_fsa_refines_agents_without_crossing_scene_boundaries(self):
+        features = torch.randn(4, 4, 3, 5, requires_grad=True)
+        adapter = FrequencyShiftAdjustment(4).train()
+
+        refined = adapter(features, torch.tensor([2, 1, 1]))
+
+        self.assertEqual(refined.shape, features.shape)
+        self.assertTrue(torch.isfinite(refined).all().item())
+        refined.square().mean().backward()
+        self.assertGreater(features.grad.abs().sum().item(), 0.0)
+
     def test_naive_grl_aligns_every_flattened_agent(self):
         agent_features, fused_features, record_len, pairwise = (
             _adapter_inputs()
@@ -284,6 +316,32 @@ class AdapterForwardTest(unittest.TestCase):
         )
         self.assertNotIn("interaction_logits", output)
 
+    def test_ssda_exposes_entropy_weighted_global_and_local_heads(self):
+        agent_features, fused_features, record_len, pairwise = (
+            _adapter_inputs()
+        )
+        adapter = SSDAAdapter(in_channels=4, hidden_dim=4).eval()
+        refined, _ = adapter.adapt_agents(agent_features, record_len)
+        class_logits = torch.randn(4, 2, 2, 2)
+
+        output = adapter(
+            refined,
+            fused_features,
+            record_len,
+            pairwise,
+            grl_lambda=0.5,
+            agent_confidence_logits=class_logits,
+        )
+
+        self.assertEqual(output["ssda_global_logits"].shape, (2, 1, 2, 2))
+        self.assertEqual(output["ssda_global_attention"].shape, (2, 1, 2, 2))
+        self.assertEqual(output["ssda_local_logits"].shape, (4, 1, 2, 2))
+        self.assertEqual(output["ssda_local_attention"].shape, (4, 1, 2, 2))
+        self.assertTrue(
+            ((output["ssda_local_attention"] >= 0)
+             & (output["ssda_local_attention"] <= 1)).all().item()
+        )
+
     def test_cudax_heads_observe_fused_outputs_without_replacing_them(self):
         agent_features, fused_features, record_len, pairwise = (
             _adapter_inputs()
@@ -330,6 +388,23 @@ class AdapterForwardTest(unittest.TestCase):
 
 
 class AdaptationLossTest(unittest.TestCase):
+    def test_entropy_weighted_domain_loss_balances_source_and_target(self):
+        logits = torch.zeros(3, 1, 2, 2, requires_grad=True)
+        attention = torch.tensor([1.0, 0.5, 0.25]).reshape(3, 1, 1, 1)
+
+        loss, accuracy, valid_count = entropy_weighted_domain_loss(
+            logits,
+            attention,
+            torch.tensor([0.0, 1.0]),
+            scene_indices=torch.tensor([0, 0, 1]),
+        )
+
+        self.assertAlmostEqual(loss.item(), math.log(2.0), places=6)
+        self.assertAlmostEqual(accuracy.item(), 0.5, places=6)
+        self.assertEqual(valid_count, 12)
+        loss.backward()
+        self.assertTrue(torch.isfinite(logits.grad).all().item())
+
     def test_balanced_domain_loss_supports_agent_pixel_logits(self):
         logits = torch.zeros(3, 1, 2, 2, requires_grad=True)
         labels = torch.tensor([0.0, 1.0])
@@ -392,7 +467,7 @@ class AdaptationLossTest(unittest.TestCase):
         loss.backward()
         torch.testing.assert_close(logits.grad, torch.zeros_like(logits))
 
-    def test_loss_dispatch_matches_all_four_methods(self):
+    def test_loss_dispatch_matches_supported_methods(self):
         labels = torch.tensor([0.0, 1.0])
         record_len = torch.tensor([2, 2])
         empty_targets = {}
@@ -458,6 +533,29 @@ class AdaptationLossTest(unittest.TestCase):
             iada_loss.item(), 0.2 * math.log(2.0), places=6
         )
         self.assertEqual(metrics["graph_variance_update_applied"].item(), 0)
+
+        ssda_loss, metrics = compute_adaptation_loss(
+            "ssda",
+            {
+                "ssda_global_logits": torch.zeros(2, 1, 1, 1),
+                "ssda_global_attention": torch.ones(2, 1, 1, 1),
+                "ssda_global_scene_index": torch.arange(2),
+                "ssda_local_logits": torch.zeros(4, 1, 1, 1),
+                "ssda_local_attention": torch.ones(4, 1, 1, 1),
+                "ssda_local_scene_index": torch.tensor([0, 0, 1, 1]),
+            },
+            labels,
+            source_scene_count=1,
+            record_len=record_len,
+            source_label_dict=empty_targets,
+            config={"ssda_global_weight": 0.5, "ssda_local_weight": 1.0},
+        )
+        self.assertAlmostEqual(
+            ssda_loss.item(), 1.5 * math.log(2.0), places=6
+        )
+        self.assertAlmostEqual(
+            metrics["domain_loss"].item(), 2.0 * math.log(2.0), places=6
+        )
 
     def test_cudax_bin_supervision_cannot_observe_target_labels(self):
         labels = torch.tensor([0.0, 1.0])
@@ -695,6 +793,26 @@ class V2XViTPriorEncodingTest(unittest.TestCase):
 
 
 class PointPillarBaselineAdapterTest(unittest.TestCase):
+    def test_ssda_runs_fsa_before_fusion_and_saa_after_detection_head(self):
+        args = _point_pillar_args(
+            {
+                "enabled": True,
+                "method": "ssda",
+                "ssda_hidden_dim": 4,
+            }
+        )
+        model = PointPillarBaseline(args).eval()
+
+        with torch.no_grad():
+            output = model(_point_pillar_input())
+
+        self.assertEqual(output["cls_preds"].shape, (2, 2, 4, 4))
+        self.assertEqual(output["ssda_global_logits"].shape, (2, 1, 4, 4))
+        self.assertEqual(output["ssda_local_logits"].shape, (3, 1, 4, 4))
+        torch.testing.assert_close(
+            output["ssda_local_scene_index"], torch.tensor([0, 0, 1])
+        )
+
     def test_native_fusion_modules_are_constructed_outside_adapter(self):
         cases = (
             ("att", "AttFusion", "att", {"feat_dim": 384}, 384),

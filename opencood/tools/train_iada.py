@@ -394,11 +394,12 @@ def train_parser():
     )
     parser.add_argument(
         "--stage",
-        choices=("baseline", "grl", "dusa", "cudax", "iada"),
+        choices=("baseline", "grl", "dusa", "cudax", "iada", "ssda"),
         default=None,
         help=(
             "baseline: source detection only; grl: naive discriminator; "
-            "dusa: LSA+CIA; cudax: CKT+BLC+CPA; iada: graph alignment"
+            "dusa: LSA+CIA; cudax: CKT+BLC+CPA; iada: graph alignment; "
+            "ssda: Selective Shift FSA+SAA"
         ),
     )
     parser.add_argument(
@@ -420,7 +421,7 @@ def _configure_stage(hypes, requested_stage):
         adapter_cfg["enabled"] = False
         adapter_cfg["method"] = "none"
         da_cfg["mode"] = "source_only"
-    elif stage in ("grl", "dusa", "cudax", "iada"):
+    elif stage in ("grl", "dusa", "cudax", "iada", "ssda"):
         adapter_cfg["enabled"] = True
         adapter_cfg["method"] = stage
         da_cfg["mode"] = "uda"
@@ -468,6 +469,8 @@ def _configure_stage(hypes, requested_stage):
         "dusa_cia_weight",
         "cudax_bin_loss_weight",
         "cudax_domain_loss_weight",
+        "ssda_global_weight",
+        "ssda_local_weight",
     )
     for key in nonnegative_weights:
         if float(da_cfg.get(key, 0.0)) < 0:

@@ -107,7 +107,14 @@ def _protocol_hypes(stage):
 
 class ConfigureStageTest(unittest.TestCase):
     def test_stage_switches_are_explicit(self):
-        for stage in ("baseline", "grl", "dusa", "cudax", "iada"):
+        for stage in (
+            "baseline",
+            "grl",
+            "dusa",
+            "cudax",
+            "iada",
+            "ssda",
+        ):
             with self.subTest(stage=stage):
                 hypes = copy.deepcopy(_hypes())
                 self.assertEqual(_configure_stage(hypes, stage), stage)
@@ -328,7 +335,7 @@ class GradientScheduleTest(unittest.TestCase):
 
 class StageOptimizerTest(unittest.TestCase):
     def test_all_adaptation_stages_use_discriminative_learning_rates(self):
-        for stage in ("grl", "dusa", "cudax", "iada"):
+        for stage in ("grl", "dusa", "cudax", "iada", "ssda"):
             with self.subTest(stage=stage):
                 model = _WarmStartModel()
                 hypes = {

@@ -148,6 +148,13 @@ class PointPillarBaseline(nn.Module):
             spatial_features_2d = self.naive_compressor(spatial_features_2d)
 
         agent_features = spatial_features_2d
+        adaptation_context = {}
+        if self.domain_adapter is not None:
+            agent_features, adaptation_context = \
+                self.domain_adapter.adapt_agents(
+                    agent_features,
+                    record_len,
+                )
         if self.fusion_method == 'v2xvit':
             prior_encoding = data_dict.get('prior_encoding')
             # The data interface stores priors as float32. Match the active
@@ -168,15 +175,15 @@ class PointPillarBaseline(nn.Module):
                 agent_features, record_len, normalized_affine_matrix
             )
 
-        adaptation_context = {}
         if self.domain_adapter is not None:
-            fused_feature, adaptation_context = \
+            fused_feature, fused_context = \
                 self.domain_adapter.adapt_fused(
                     agent_features,
                     fused_feature,
                     record_len,
                     data_dict.get('grl_lambda', 1.0),
                 )
+            adaptation_context.update(fused_context)
 
         psm = self.cls_head(fused_feature)
         rm = self.reg_head(fused_feature)

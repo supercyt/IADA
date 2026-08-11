@@ -131,6 +131,14 @@ model:
       ckt_shuffle_groups: 2
       cudax_bin_count: 5
       cpa_hidden_dim: 1024
+      # Selective Shift (SSDA): FSA is applied to every decoded agent feature
+      # before fusion; SAA aligns ego/global and all-agent/local feature maps.
+      ssda_hidden_dim: 128
+      sao_enabled: true
+      sao_probability: 1.0
+      fsa_epsilon: 0.00001
+      # Keep false for the paper-style joint entropy-guided optimization.
+      ssda_detach_attention: false
 
     dir_args: *dir_args
 
@@ -187,6 +195,9 @@ domain_adaptation:
   dusa_cia_weight: 1.0
   cudax_bin_loss_weight: 0.1
   cudax_domain_loss_weight: 0.1
+  # Equation (18) in Selective Shift uses beta_1=0.5 and beta_2=1.0.
+  ssda_global_weight: 0.5
+  ssda_local_weight: 1.0
   cudax_bin_count: 5
   # REQUIRED before --stage cudax. Fill six positive bounds in encoded-target
   # order [dx, dy, dz, dlog_h, dlog_w, dlog_l], computed only from positive

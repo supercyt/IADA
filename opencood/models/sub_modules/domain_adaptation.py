@@ -22,6 +22,7 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from opencood.models.sub_modules.interaction_da import (
     GradientReversal,
@@ -152,6 +153,15 @@ class FusionAgnosticDomainAdapter(nn.Module):
 
     method = "none"
     requires_agent_confidence = False
+
+    def adapt_agents(
+        self,
+        agent_features: torch.Tensor,
+        record_len: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Optionally refine per-agent features before collaboration."""
+
+        return agent_features, {}
 
     def adapt_fused(
         self,
@@ -414,6 +424,418 @@ class IADAAdapter(FusionAgnosticDomainAdapter):
             "graph_embedding": graph_output["graph_embedding"],
             "valid_graph_mask": graph_output["valid_graph_mask"],
         }
+
+
+class HaarWaveletReconstruction(nn.Module):
+    """Fixed depth-wise 2D Haar analysis and per-band reconstruction.
+
+    The four returned channel groups are the reconstructed LL, LH, HL, and HH
+    components from equations (1)-(3) of Selective Shift. Padding is removed
+    after reconstruction so the module also supports odd-sized feature maps.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        filters = torch.tensor(
+            (
+                ((1.0, 1.0), (1.0, 1.0)),
+                ((-1.0, -1.0), (1.0, 1.0)),
+                ((-1.0, 1.0), (-1.0, 1.0)),
+                ((1.0, -1.0), (-1.0, 1.0)),
+            )
+        ).unsqueeze(1) / 2.0
+        self.register_buffer("filters", filters, persistent=True)
+
+    def _analysis(
+        self,
+        features: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Tuple[int, int]]:
+        if features.ndim != 4:
+            raise ValueError("Haar input must have shape [N, C, H, W]")
+        if not features.is_floating_point():
+            raise TypeError("Haar input must use a floating-point dtype")
+
+        height, width = features.shape[-2:]
+        pad_bottom = height % 2
+        pad_right = width % 2
+        padded = F.pad(
+            features,
+            (0, pad_right, 0, pad_bottom),
+            mode="replicate",
+        )
+        channels = features.shape[1]
+        analysis_filters = self.filters.to(
+            device=features.device, dtype=features.dtype
+        ).repeat(channels, 1, 1, 1)
+        coefficients = F.conv2d(
+            padded,
+            analysis_filters,
+            stride=2,
+            groups=channels,
+        )
+        coefficient_height, coefficient_width = coefficients.shape[-2:]
+        coefficients = coefficients.reshape(
+            features.shape[0],
+            channels,
+            4,
+            coefficient_height,
+            coefficient_width,
+        )
+        return coefficients, (height, width)
+
+    def _reconstruct_band(
+        self,
+        coefficients: torch.Tensor,
+        band: int,
+        output_size: Tuple[int, int],
+    ) -> torch.Tensor:
+        channels = coefficients.shape[1]
+        filters = self.filters.to(
+            device=coefficients.device, dtype=coefficients.dtype
+        )
+        synthesis_filter = filters[band : band + 1].repeat(
+            channels, 1, 1, 1
+        )
+        component = F.conv_transpose2d(
+            coefficients[:, :, band],
+            synthesis_filter,
+            stride=2,
+            groups=channels,
+        )
+        height, width = output_size
+        return component[..., :height, :width]
+
+    def band_summaries(self, features: torch.Tensor) -> torch.Tensor:
+        """Return channel-mean reconstructed bands without a 4C allocation."""
+
+        coefficients, output_size = self._analysis(features)
+        summaries = []
+        for band in range(4):
+            component = self._reconstruct_band(
+                coefficients, band, output_size
+            )
+            summaries.append(component.mean(dim=1, keepdim=True))
+        return torch.cat(summaries, dim=1)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        coefficients, output_size = self._analysis(features)
+        reconstructed = []
+        for band in range(4):
+            reconstructed.append(
+                self._reconstruct_band(coefficients, band, output_size)
+            )
+        return torch.cat(reconstructed, dim=1)
+
+
+class FrequencyShiftAdjustment(nn.Module):
+    """Frequency-decoupled feature shift adjustment (FSA)."""
+
+    def __init__(
+        self,
+        channels: int,
+        sao_enabled: bool = True,
+        sao_probability: float = 1.0,
+        epsilon: float = 1.0e-5,
+    ) -> None:
+        super().__init__()
+        if channels <= 0:
+            raise ValueError("FSA channels must be positive")
+        if sao_probability < 0 or sao_probability > 1:
+            raise ValueError("sao_probability must be in [0, 1]")
+        if epsilon <= 0:
+            raise ValueError("FSA epsilon must be positive")
+        self.sao_enabled = bool(sao_enabled)
+        self.sao_probability = float(sao_probability)
+        self.epsilon = float(epsilon)
+        self.wavelet = HaarWaveletReconstruction()
+        # Summing four per-band convolutions is equivalent to applying one
+        # localized grouped convolution to Cat(LL, LH, HL, HH), while allowing
+        # checkpointed reconstruction without a [N, 4C, H, W] allocation.
+        self.frequency_attention = nn.ModuleList(
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=3,
+                padding=1,
+                groups=channels,
+            )
+            for _ in range(4)
+        )
+        self.statistical_affine = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=1,
+            groups=channels,
+        )
+        # Both learned multiplicative maps start neutral; SAO normalization is
+        # intentionally active from the beginning of SSDA training.
+        for layer in self.frequency_attention:
+            nn.init.zeros_(layer.weight)
+            nn.init.zeros_(layer.bias)
+        nn.init.zeros_(self.statistical_affine.weight)
+        nn.init.zeros_(self.statistical_affine.bias)
+
+    @staticmethod
+    def _share_scene_maps(
+        maps: torch.Tensor,
+        record_len: torch.Tensor,
+    ) -> torch.Tensor:
+        counts = _record_len_tensor(record_len, maps.device)
+        if int(counts.sum().item()) != maps.shape[0]:
+            raise ValueError("FSA record_len does not match agent features")
+        shared = []
+        offset = 0
+        for count_tensor in counts:
+            count = int(count_tensor.item())
+            scene_map = maps[offset : offset + count].mean(
+                dim=0, keepdim=True
+            )
+            shared.append(scene_map.expand(count, -1, -1, -1))
+            offset += count
+        return torch.cat(shared, dim=0)
+
+    def _donor_indices(
+        self,
+        record_len: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        counts = _record_len_tensor(record_len, device)
+        indices = []
+        offset = 0
+        for count_tensor in counts:
+            count = int(count_tensor.item())
+            if count == 1:
+                permutation = torch.zeros(
+                    1, dtype=torch.long, device=counts.device
+                )
+            else:
+                # A cyclic non-zero shift guarantees that every agent receives
+                # another agent's statistics while remaining scene-local.
+                shift = int(
+                    torch.randint(1, count, (), device=counts.device).item()
+                )
+                permutation = (
+                    torch.arange(count, device=counts.device) + shift
+                ) % count
+            indices.append(permutation + offset)
+            offset += count
+        return torch.cat(indices)
+
+    def forward(
+        self,
+        features: torch.Tensor,
+        record_len: torch.Tensor,
+    ) -> torch.Tensor:
+        coefficients, output_size = self.wavelet._analysis(features)
+        agent_maps = None
+        for band, refinement in enumerate(self.frequency_attention):
+            def refine_band(values, band_index=band, layer=refinement):
+                component = self.wavelet._reconstruct_band(
+                    values, band_index, output_size
+                )
+                return layer(component)
+
+            if self.training and coefficients.requires_grad:
+                band_map = checkpoint(
+                    refine_band,
+                    coefficients,
+                    use_reentrant=False,
+                )
+            else:
+                band_map = refine_band(coefficients)
+            agent_maps = (
+                band_map if agent_maps is None else agent_maps + band_map
+            )
+        shared_maps = self._share_scene_maps(agent_maps, record_len)
+        frequency_weights = 1.0 + torch.tanh(shared_maps)
+        refined = frequency_weights * features
+
+        donor_features = refined
+        apply_sao = (
+            self.training
+            and self.sao_enabled
+            and self.sao_probability > 0
+        )
+        if apply_sao:
+            should_swap = self.sao_probability >= 1.0 or bool(
+                torch.rand((), device=features.device).item()
+                < self.sao_probability
+            )
+            if should_swap:
+                donor_features = refined[
+                    self._donor_indices(record_len, refined.device)
+                ]
+
+        # Accumulate statistics in float32 under AMP; cast the normalized map
+        # back before the learned affine weighting.
+        statistical_features = donor_features.float()
+        donor_mean = statistical_features.mean(dim=(-2, -1), keepdim=True)
+        donor_variance = statistical_features.var(
+            dim=(-2, -1), keepdim=True, unbiased=False
+        )
+        obfuscated = (
+            (refined.float() - donor_mean)
+            * torch.rsqrt(donor_variance + self.epsilon)
+        ).to(refined.dtype)
+        statistical_weights = 1.0 + torch.tanh(
+            self.statistical_affine(obfuscated)
+        )
+        return statistical_weights * obfuscated
+
+
+class StagedAdaptiveAlignment(nn.Module):
+    """Entropy-driven global and local alignment heads (SAA)."""
+
+    def __init__(
+        self,
+        channels: int,
+        hidden_dim: int = 128,
+        detach_attention: bool = False,
+    ) -> None:
+        super().__init__()
+        if channels <= 0 or hidden_dim <= 0:
+            raise ValueError("SAA dimensions must be positive")
+        self.detach_attention = bool(detach_attention)
+        self.gradient_reversal = GradientReversal()
+        self.global_classifier = nn.Sequential(
+            nn.Conv2d(channels, hidden_dim, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, 1, kernel_size=1),
+        )
+        self.local_classifier = nn.Sequential(
+            nn.Conv2d(channels, hidden_dim, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, 1, kernel_size=1),
+        )
+        self.local_attention_fusion = nn.Conv2d(2, 1, kernel_size=1)
+
+    @staticmethod
+    def _entropy(probabilities: torch.Tensor) -> torch.Tensor:
+        epsilon = torch.finfo(probabilities.dtype).eps
+        probabilities = probabilities.clamp(epsilon, 1.0 - epsilon)
+        return -(
+            probabilities * probabilities.log()
+            + (1.0 - probabilities) * (1.0 - probabilities).log()
+        )
+
+    def forward(
+        self,
+        agent_features: torch.Tensor,
+        record_len: torch.Tensor,
+        grl_lambda: float,
+        agent_class_logits: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        if agent_class_logits.shape[0] != agent_features.shape[0]:
+            raise ValueError("SAA class logits and agent features differ")
+        if agent_class_logits.shape[-2:] != agent_features.shape[-2:]:
+            raise ValueError("SAA class logits and features must share H/W")
+
+        class_probabilities = agent_class_logits.sigmoid()
+        entropy = self._entropy(class_probabilities)
+        entropy_scale = agent_features.new_tensor(2.0).log()
+        ego_entropy = extract_ego_features(entropy, record_len)
+        global_attention = ego_entropy.amin(dim=1, keepdim=True) / entropy_scale
+
+        local_entropy = (
+            entropy.amin(dim=1, keepdim=True)
+            + entropy.amax(dim=1, keepdim=True)
+        ) / (2.0 * entropy_scale)
+        volume_attention = class_probabilities.amin(dim=1, keepdim=True)
+        mixture = torch.sigmoid(
+            self.local_attention_fusion(
+                torch.cat((local_entropy, volume_attention), dim=1)
+            )
+        )
+        local_attention = (
+            mixture * volume_attention
+            + (1.0 - mixture) * local_entropy
+        )
+        if self.detach_attention:
+            global_attention = global_attention.detach()
+            local_attention = local_attention.detach()
+
+        ego_features = extract_ego_features(agent_features, record_len)
+        global_logits = self.global_classifier(
+            self.gradient_reversal(
+                ego_features, coefficient=grl_lambda
+            )
+        )
+        local_logits = self.local_classifier(
+            self.gradient_reversal(
+                agent_features, coefficient=grl_lambda
+            )
+        )
+        scene_indices, local_indices = scene_and_local_indices(
+            record_len, agent_features.device
+        )
+        return {
+            "ssda_global_logits": global_logits,
+            "ssda_global_attention": global_attention,
+            "ssda_global_scene_index": torch.arange(
+                len(record_len), device=agent_features.device
+            ),
+            "ssda_local_logits": local_logits,
+            "ssda_local_attention": local_attention,
+            "ssda_local_scene_index": scene_indices,
+            "ssda_local_agent_index": local_indices,
+        }
+
+
+class SSDAAdapter(FusionAgnosticDomainAdapter):
+    """Selective Shift domain adaptation with FSA and SAA."""
+
+    method = "ssda"
+    requires_agent_confidence = True
+
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_dim: int = 128,
+        sao_enabled: bool = True,
+        sao_probability: float = 1.0,
+        fsa_epsilon: float = 1.0e-5,
+        detach_attention: bool = False,
+    ) -> None:
+        super().__init__()
+        self.fsa = FrequencyShiftAdjustment(
+            in_channels,
+            sao_enabled=sao_enabled,
+            sao_probability=sao_probability,
+            epsilon=fsa_epsilon,
+        )
+        self.saa = StagedAdaptiveAlignment(
+            in_channels,
+            hidden_dim=hidden_dim,
+            detach_attention=detach_attention,
+        )
+
+    def adapt_agents(
+        self,
+        agent_features: torch.Tensor,
+        record_len: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        return self.fsa(agent_features, record_len), {}
+
+    def forward(
+        self,
+        agent_features: torch.Tensor,
+        fused_features: torch.Tensor,
+        record_len: torch.Tensor,
+        pairwise_t_matrix: torch.Tensor,
+        grl_lambda: float,
+        agent_confidence_logits: Optional[torch.Tensor] = None,
+        fused_class_logits: Optional[torch.Tensor] = None,
+        context: Optional[Dict[str, torch.Tensor]] = None,
+        detection_features: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        if agent_confidence_logits is None:
+            raise ValueError("SSDA requires per-agent classification logits")
+        return self.saa(
+            agent_features,
+            record_len,
+            grl_lambda,
+            agent_confidence_logits,
+        )
 
 
 class CollaborativeKnowledgeTransfer(nn.Module):
@@ -714,6 +1136,17 @@ def build_domain_adapter(
                 config.get("normalize_domain_embedding", True)
             ),
         )
+    if method == "ssda":
+        return SSDAAdapter(
+            in_channels,
+            hidden_dim=int(config.get("ssda_hidden_dim", hidden_dim)),
+            sao_enabled=bool(config.get("sao_enabled", True)),
+            sao_probability=float(config.get("sao_probability", 1.0)),
+            fsa_epsilon=float(config.get("fsa_epsilon", 1.0e-5)),
+            detach_attention=bool(
+                config.get("ssda_detach_attention", False)
+            ),
+        )
     if method == "cudax":
         return CUDAXAdapter(
             in_channels,
@@ -741,7 +1174,8 @@ def build_domain_adapter(
             cpa_hidden_dim=int(config.get("cpa_hidden_dim", 1024)),
         )
     raise ValueError(
-        "domain_adapter.method must be one of grl, dusa, cudax, or iada; "
+        "domain_adapter.method must be one of grl, dusa, cudax, iada, or "
+        "ssda; "
         f"got {config.get('method')!r}"
     )
 
@@ -752,7 +1186,11 @@ __all__ = [
     "FusionAgnosticDomainAdapter",
     "GlobalDomainDiscriminator",
     "IADAAdapter",
+    "FrequencyShiftAdjustment",
+    "HaarWaveletReconstruction",
     "NaiveDomainAdapter",
+    "SSDAAdapter",
+    "StagedAdaptiveAlignment",
     "build_domain_adapter",
     "extract_ego_features",
     "scene_and_local_indices",
