@@ -146,8 +146,8 @@ lr_scheduler:
   step_size: [15]
 
 domain_adaptation:
-  # Train the source-only checkpoint first, then invoke --stage ssda with that
-  # checkpoint via --pretrained_model_dir.
+  # Omit pretrained_model_dir for a scratch comparison, or pass a matching
+  # source-only checkpoint to warm-start the detector.
   stage: baseline
   mode: source_only
   seed: 303
@@ -168,8 +168,8 @@ domain_adaptation:
   ssda_global_weight: 0.5
   ssda_local_weight: 1.0
 
-  # The host detector is warm-started from the matching source baseline while
-  # the newly created FSA/SAA branch learns at the configured optimizer LR.
+  # These LR scales apply only when a matching source baseline is supplied.
+  # Scratch runs train the detector and FSA/SAA together at optimizer.lr.
   pretrained_lr_scale: 0.1
   adapter_lr_scale: 1.0
   gradient_clip_norm: 10.0

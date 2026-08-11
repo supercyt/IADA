@@ -334,6 +334,33 @@ class GradientScheduleTest(unittest.TestCase):
 
 
 class StageOptimizerTest(unittest.TestCase):
+    def test_scratch_adaptation_uses_base_lr_for_every_parameter(self):
+        model = _WarmStartModel()
+        hypes = {
+            "optimizer": {
+                "core_method": "Adam",
+                "lr": 2.0e-4,
+                "args": {"weight_decay": 1.0e-4},
+            },
+            "domain_adaptation": {
+                "initialization": "scratch",
+                "pretrained_lr_scale": 0.1,
+                "adapter_lr_scale": 1.0,
+            },
+        }
+
+        optimizer = _setup_stage_optimizer(hypes, model, "iada")
+
+        self.assertEqual(len(optimizer.param_groups), 1)
+        self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 2.0e-4)
+        self.assertEqual(
+            {
+                id(parameter)
+                for parameter in optimizer.param_groups[0]["params"]
+            },
+            {id(parameter) for parameter in model.parameters()},
+        )
+
     def test_all_adaptation_stages_use_discriminative_learning_rates(self):
         for stage in ("grl", "dusa", "cudax", "iada", "ssda"):
             with self.subTest(stage=stage):

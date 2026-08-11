@@ -222,6 +222,6 @@ domain_adaptation:
     gamma: 10.0
 
   # Optional in-file warm start. The CLI --pretrained_model_dir takes
-  # precedence and every non-baseline stage must start from this config's
-  # matching source-only baseline, never from another adaptation method.
+  # precedence. Leave empty to train the selected adaptation stage from
+  # scratch; when supplied, it must be this protocol's source-only baseline.
   pretrained_model_dir: ""

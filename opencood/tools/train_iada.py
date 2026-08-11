@@ -390,7 +390,10 @@ def train_parser():
     parser.add_argument(
         "--pretrained_model_dir",
         default="",
-        help="Warm start a new method from its matching baseline directory.",
+        help=(
+            "Warm start a new method from its matching baseline directory. "
+            "Omit it to train the detector and adapter from scratch."
+        ),
     )
     parser.add_argument(
         "--stage",
@@ -598,15 +601,25 @@ def _grl_lambda(global_step, total_steps, max_value, gamma):
 
 
 def _setup_stage_optimizer(hypes, model, stage):
-    """Use a smaller LR for warm-started detector parameters.
+    """Configure a uniform scratch LR or discriminative warm-start LRs.
 
-    The adapter branch is initialized from scratch and keeps the optimizer
-    base learning rate. The already converged encoder, fusion modules, and
-    detection heads use ``pretrained_lr_scale``. Scheduler updates preserve
-    this ratio because both parameter groups belong to the same optimizer.
+    A scratch run initializes every parameter together and therefore trains
+    the detector and adapter at the optimizer base LR. For a baseline-warm-
+    started adaptation run, the fresh adapter keeps the base LR while the
+    detector uses ``pretrained_lr_scale``. The initialization mode is persisted
+    in config.yaml so resume reconstructs the same optimizer parameter groups.
     """
 
-    if stage == "baseline":
+    initialization = hypes["domain_adaptation"].get(
+        "initialization",
+        "scratch" if stage == "baseline" else "baseline_warm_start",
+    )
+    if initialization not in ("scratch", "baseline_warm_start"):
+        raise ValueError(
+            "domain_adaptation.initialization must be 'scratch' or "
+            "'baseline_warm_start'"
+        )
+    if stage == "baseline" or initialization == "scratch":
         return train_utils.setup_optimizer(hypes, model)
 
     optimizer_cfg = hypes["optimizer"]
@@ -713,23 +726,30 @@ def main():
     stage = _configure_stage(hypes, opt.stage)
     da_cfg = hypes["domain_adaptation"]
     pretrained_model_dir = ""
-    if not opt.model_dir:
+    if opt.model_dir:
+        # Runs created before this field existed could only be warm-started for
+        # adaptation stages, so that is the safe legacy resume default.
+        initialization = da_cfg.get(
+            "initialization",
+            "scratch" if stage == "baseline" else "baseline_warm_start",
+        )
+    else:
         pretrained_model_dir = (
             opt.pretrained_model_dir
             or da_cfg.get("pretrained_model_dir", "")
         )
-        if stage != "baseline" and not pretrained_model_dir:
-            raise ValueError(
-                f"Stage {stage!r} requires --pretrained_model_dir pointing "
-                "to a source-only common-geometry baseline run."
-            )
-        if stage != "baseline":
+        initialization = (
+            "baseline_warm_start" if pretrained_model_dir else "scratch"
+        )
+        if stage != "baseline" and pretrained_model_dir:
             _validate_baseline_warm_start(pretrained_model_dir, hypes)
+    da_cfg["initialization"] = initialization
 
     _set_random_seed(int(da_cfg.get("seed", 303)))
     source_hypes = build_source_config(hypes)
 
     print(f"Training stage: {stage}")
+    print(f"Initialization: {initialization}")
     print("Building source OPV2V datasets")
     source_train_dataset = build_dataset(
         source_hypes, visualize=False, train=True

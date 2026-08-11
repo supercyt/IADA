@@ -41,6 +41,16 @@ python opencood/tools/train_iada.py \
   --pretrained_model_dir opencood/logs/<baseline-run-directory>
 ```
 
+For a from-scratch comparison, omit `--pretrained_model_dir`. The detector,
+fusion module, and domain adapter will all be randomly initialized and trained
+at the optimizer base learning rate:
+
+```bash
+python opencood/tools/train_iada.py \
+  --hypes_yaml opencood/hypes_yaml/domain_adaptation/v2xset_to_dair/pointpillar_attfuse_ssda.yaml \
+  --stage ssda
+```
+
 Evaluate the resulting checkpoint on the target split with:
 
 ```bash
