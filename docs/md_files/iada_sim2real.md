@@ -196,6 +196,21 @@ python opencood/tools/inference.py \
   --fusion_method intermediate
 ```
 
+To evaluate a specific periodic checkpoint instead of the best-validation
+checkpoint, pass its epoch number explicitly:
+
+```bash
+python opencood/tools/inference.py \
+  --model_dir opencood/logs/<run> \
+  --fusion_method intermediate \
+  --checkpoint_epoch 10
+```
+
+This loads `net_epoch10.pth` from the run directory. Omitting
+`--checkpoint_epoch` preserves the default selection rule: prefer the single
+`net_epoch_bestval_at*.pth` checkpoint, then fall back to the latest periodic
+checkpoint.
+
 For a controlled table, report the baseline and all requested adaptation
 methods for the same fusion config, seed, source baseline, residual-bound rule,
 and DAIR split.

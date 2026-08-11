@@ -33,6 +33,13 @@ def test_parser():
     parser.add_argument('--no_score', action='store_true',
                         help="whether print the score of prediction")
     parser.add_argument('--note', default="", type=str, help="any other thing?")
+    parser.add_argument(
+        '--checkpoint_epoch',
+        type=int,
+        default=None,
+        help='load net_epochN.pth for the specified N instead of automatically '
+             'selecting the best-validation or latest checkpoint',
+    )
     opt = parser.parse_args()
     return opt
 
@@ -91,7 +98,9 @@ def main():
 
     print('Loading Model from checkpoint')
     saved_path = opt.model_dir
-    resume_epoch, model = train_utils.load_saved_model(saved_path, model)
+    resume_epoch, model = train_utils.load_saved_model(
+        saved_path, model, checkpoint_epoch=opt.checkpoint_epoch
+    )
     print(f"resume from {resume_epoch} epoch.")
     opt.note += f"_epoch{resume_epoch}"
     

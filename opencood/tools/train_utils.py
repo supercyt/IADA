@@ -26,7 +26,7 @@ def backup_script(full_path, folders_to_save=["models", "data_utils", "utils", "
         source_folder = os.path.join(current_path, f'../{folder_name}')
         shutil.copytree(source_folder, ttarget_folder)
 
-def load_saved_model(saved_path, model):
+def load_saved_model(saved_path, model, checkpoint_epoch=None):
     """
     Load saved model if exiseted
 
@@ -37,12 +37,33 @@ def load_saved_model(saved_path, model):
     model : opencood object
         The model instance.
 
+    checkpoint_epoch : int or None
+        Load ``net_epoch{checkpoint_epoch}.pth`` when specified. By default,
+        retain the historical behavior of preferring the best-validation
+        checkpoint and otherwise loading the latest periodic checkpoint.
+
     Returns
     -------
     model : opencood object
         The model instance loaded pretrained params.
     """
     assert os.path.exists(saved_path), '{} not found'.format(saved_path)
+
+    if checkpoint_epoch is not None:
+        if checkpoint_epoch < 0:
+            raise ValueError("checkpoint_epoch must be non-negative")
+        checkpoint_path = os.path.join(
+            saved_path, 'net_epoch%d.pth' % checkpoint_epoch
+        )
+        if not os.path.isfile(checkpoint_path):
+            raise FileNotFoundError(
+                'Requested checkpoint not found: %s' % checkpoint_path
+            )
+        print('loading requested checkpoint at epoch %d' % checkpoint_epoch)
+        model.load_state_dict(
+            torch.load(checkpoint_path, map_location='cpu'), strict=False
+        )
+        return checkpoint_epoch, model
 
     def findLastCheckpoint(save_dir):
         file_list = glob.glob(os.path.join(save_dir, '*epoch*.pth'))
