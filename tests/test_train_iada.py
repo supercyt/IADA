@@ -14,6 +14,7 @@ import yaml
 from opencood.tools.train_iada import (
     TRAINING_STATE_FILENAME,
     _balanced_domain_loss,
+    _build_clean_validation_config,
     _configure_stage,
     _find_model_checkpoint,
     _graph_variance_floor_loss,
@@ -28,6 +29,7 @@ from opencood.tools.train_iada import (
     _setup_stage_optimizer,
     _slice_detection_output,
     _validate_baseline_warm_start,
+    _validate_detection,
 )
 
 
@@ -149,6 +151,51 @@ class ConfigureStageTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "bin count differs"):
             _configure_stage(hypes, "cudax")
+
+
+class ValidationConfigTest(unittest.TestCase):
+    def test_disables_noise_without_mutating_training_config(self):
+        training_hypes = {
+            "noise_setting": {
+                "add_noise": True,
+                "args": {
+                    "pos_std": 0.2,
+                    "rot_std": 0.3,
+                    "pos_mean": 0.1,
+                    "rot_mean": -0.1,
+                    "laplace": True,
+                },
+            }
+        }
+
+        validation_hypes = _build_clean_validation_config(training_hypes)
+
+        self.assertTrue(training_hypes["noise_setting"]["add_noise"])
+        self.assertEqual(
+            training_hypes["noise_setting"]["args"]["pos_std"], 0.2
+        )
+        self.assertFalse(validation_hypes["noise_setting"]["add_noise"])
+        for key in ("pos_std", "rot_std", "pos_mean", "rot_mean"):
+            self.assertEqual(
+                validation_hypes["noise_setting"]["args"][key], 0
+            )
+        self.assertTrue(
+            validation_hypes["noise_setting"]["args"]["laplace"]
+        )
+
+    def test_populates_zero_noise_when_setting_is_missing(self):
+        validation_hypes = _build_clean_validation_config({})
+
+        self.assertFalse(validation_hypes["noise_setting"]["add_noise"])
+        self.assertEqual(
+            validation_hypes["noise_setting"]["args"],
+            {
+                "pos_std": 0,
+                "rot_std": 0,
+                "pos_mean": 0,
+                "rot_mean": 0,
+            },
+        )
 
 
 class DomainLossTest(unittest.TestCase):
@@ -394,6 +441,51 @@ class GradientScheduleTest(unittest.TestCase):
     def test_dann_schedule_starts_zero_and_approaches_max(self):
         self.assertEqual(_grl_lambda(0, 100, 1.0, 10.0), 0.0)
         self.assertGreater(_grl_lambda(99, 100, 1.0, 10.0), 0.999)
+
+
+class ValidationTest(unittest.TestCase):
+    def test_target_validation_uses_target_agent_prior(self):
+        model = unittest.mock.Mock()
+        model.return_value = {
+            "cls_preds": torch.tensor([[[[1.0]]]]),
+            "reg_preds": torch.tensor([[[[2.0]]]]),
+        }
+        criterion = unittest.mock.Mock(return_value=torch.tensor(3.0))
+        ego_batch = {
+            "processed_lidar": {},
+            "record_len": torch.tensor([2]),
+            "pairwise_t_matrix": torch.eye(4).reshape(1, 1, 1, 4, 4).repeat(
+                1, 2, 2, 1, 1
+            ),
+            "lidar_pose": torch.zeros(2, 6),
+            "label_dict": {},
+        }
+
+        loss = _validate_detection(
+            model,
+            criterion,
+            [{"ego": ego_batch}],
+            torch.device("cpu"),
+            domain="target",
+        )
+
+        self.assertEqual(loss, 3.0)
+        model_inputs = model.call_args.args[0]
+        expected_prior = torch.zeros(1, 2, 3)
+        expected_prior[0, 1, 2] = 1.0
+        torch.testing.assert_close(
+            model_inputs["prior_encoding"], expected_prior
+        )
+
+    def test_validation_rejects_unknown_domain(self):
+        with self.assertRaisesRegex(ValueError, "validation domain"):
+            _validate_detection(
+                unittest.mock.Mock(),
+                unittest.mock.Mock(),
+                [],
+                torch.device("cpu"),
+                domain="other",
+            )
 
 
 class StageOptimizerTest(unittest.TestCase):

@@ -1,6 +1,7 @@
 """Train fusion-agnostic OPV2V-to-DAIR domain adaptation baselines."""
 
 import argparse
+import copy
 import glob
 import math
 import os
@@ -523,6 +524,18 @@ def _seed_worker(_worker_id):
     random.seed(worker_seed)
 
 
+def _build_clean_validation_config(hypes):
+    """Copy a dataset config and disable synthetic localization noise."""
+
+    validation_hypes = copy.deepcopy(hypes)
+    noise_setting = validation_hypes.setdefault("noise_setting", {})
+    noise_setting["add_noise"] = False
+    noise_args = noise_setting.setdefault("args", {})
+    for key in ("pos_std", "rot_std", "pos_mean", "rot_mean"):
+        noise_args[key] = 0
+    return validation_hypes
+
+
 def _set_random_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -724,7 +737,10 @@ def _setup_stage_optimizer(hypes, model, stage):
 
 
 @torch.no_grad()
-def _validate_source(model, criterion, data_loader, device):
+def _validate_detection(model, criterion, data_loader, device, domain):
+    if domain not in ("source", "target"):
+        raise ValueError("validation domain must be 'source' or 'target'")
+
     model.eval()
     validation_losses = []
 
@@ -733,7 +749,7 @@ def _validate_source(model, criterion, data_loader, device):
             continue
         ego_batch = batch_data["ego"]
         model_inputs = train_utils.to_device(
-            _select_model_inputs(ego_batch), device
+            _select_model_inputs(ego_batch, domain), device
         )
         model_inputs["grl_lambda"] = 0.0
         label_dict = train_utils.to_device(ego_batch["label_dict"], device)
@@ -746,8 +762,22 @@ def _validate_source(model, criterion, data_loader, device):
         validation_losses.append(float(validation_loss.item()))
 
     if not validation_losses:
-        raise RuntimeError("Source validation loader produced no valid batch")
+        raise RuntimeError(
+            f"{domain.capitalize()} validation loader produced no valid batch"
+        )
     return statistics.mean(validation_losses)
+
+
+def _validate_source(model, criterion, data_loader, device):
+    return _validate_detection(
+        model, criterion, data_loader, device, domain="source"
+    )
+
+
+def _validate_target(model, criterion, data_loader, device):
+    return _validate_detection(
+        model, criterion, data_loader, device, domain="target"
+    )
 
 
 def main():
@@ -794,6 +824,8 @@ def main():
 
     _set_random_seed(int(da_cfg.get("seed", 303)))
     source_hypes = build_source_config(hypes)
+    source_validate_hypes = _build_clean_validation_config(source_hypes)
+    target_validate_hypes = _build_clean_validation_config(hypes)
 
     print(f"Training stage: {stage}")
     print(f"Initialization: {initialization}")
@@ -802,18 +834,22 @@ def main():
         source_hypes, visualize=False, train=True
     )
     source_validate_dataset = build_dataset(
-        source_hypes, visualize=False, train=False
+        source_validate_hypes, visualize=False, train=False
     )
 
     use_target = stage != "baseline"
     target_train_dataset = None
+    target_validate_dataset = None
     if use_target:
         print(
             "Building target DAIR-V2X dataset "
-            "(target labels are excluded from model inputs and losses)"
+            "(target labels are excluded from model inputs and training losses)"
         )
         target_train_dataset = build_dataset(
             hypes, visualize=False, train=True
+        )
+        target_validate_dataset = build_dataset(
+            target_validate_hypes, visualize=False, train=False
         )
 
     source_batch_size = int(da_cfg.get("source_batch_size", 2))
@@ -838,6 +874,7 @@ def main():
         pin_memory=pin_memory,
     )
     target_train_loader = None
+    target_validate_loader = None
     if use_target:
         target_train_loader = _make_loader(
             target_train_dataset,
@@ -845,6 +882,14 @@ def main():
             num_workers,
             shuffle=True,
             drop_last=True,
+            pin_memory=pin_memory,
+        )
+        target_validate_loader = _make_loader(
+            target_validate_dataset,
+            target_batch_size,
+            num_workers,
+            shuffle=False,
+            drop_last=False,
             pin_memory=pin_memory,
         )
 
@@ -1165,6 +1210,21 @@ def main():
                 f"Epoch {epoch}: source validation loss "
                 f"{source_validation_loss:.4f}"
             )
+
+            if target_validate_loader is not None:
+                target_validation_loss = _validate_target(
+                    model, criterion, target_validate_loader, device
+                )
+                writer.add_scalar(
+                    "Validate/target_loss",
+                    target_validation_loss,
+                    epoch,
+                )
+                print(
+                    f"Epoch {epoch}: target validation loss "
+                    f"{target_validation_loss:.4f} "
+                    "(logging only; does not select the best checkpoint)"
+                )
 
             if source_validation_loss < best_validation_loss:
                 best_validation_loss = source_validation_loss
