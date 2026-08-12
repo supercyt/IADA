@@ -20,7 +20,12 @@ train_params:
 # The first experiment isolates Sim2Real shift from additional synthetic pose
 # noise. DAIR's system_error_offset in the raw calibration is still retained.
 noise_setting:
-  add_noise: false
+  add_noise: true
+  args:
+    pos_std: 0.2
+    rot_std: 0.2
+    pos_mean: 0
+    rot_mean: 0
 
 input_source: ['lidar']
 label_type: 'lidar'

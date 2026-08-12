@@ -17,7 +17,12 @@ train_params:
   max_cav: 2
 
 noise_setting:
-  add_noise: false
+  add_noise: true
+  args:
+    pos_std: 0.2
+    rot_std: 0.2
+    pos_mean: 0
+    rot_mean: 0
 
 input_source: ['lidar']
 label_type: 'lidar'
