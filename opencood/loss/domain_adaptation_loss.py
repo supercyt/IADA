@@ -223,6 +223,128 @@ def graph_variance_floor_loss(
     return graph_embedding.sum() * 0.0, 0
 
 
+def single_domain_loss(
+    domain_logits: torch.Tensor,
+    domain_label: float,
+    scene_indices: Optional[torch.Tensor] = None,
+    valid_mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """Return the mean adversarial loss for one domain mini-batch.
+
+    This is the per-domain half of :func:`balanced_domain_loss`.  Keeping it
+    separate lets training backpropagate through the source graph before the
+    target forward is constructed, while preserving the original balanced
+    source/target objective.
+    """
+
+    if domain_label not in (0.0, 1.0):
+        raise ValueError("domain_label must be either 0 or 1")
+    if domain_logits.ndim == 0 or domain_logits.shape[0] == 0:
+        raise ValueError("domain_logits must have a non-empty batch dimension")
+
+    if scene_indices is not None:
+        scene_indices = scene_indices.reshape(-1)
+        if scene_indices.numel() != domain_logits.shape[0]:
+            raise ValueError("scene_indices must match the first logit dimension")
+
+    labels = torch.full_like(domain_logits, float(domain_label))
+    if valid_mask is None:
+        valid = torch.ones_like(domain_logits, dtype=torch.bool)
+    else:
+        valid = valid_mask.to(device=domain_logits.device, dtype=torch.bool)
+        if valid.ndim == 1 and domain_logits.ndim > 1:
+            valid = valid.reshape(
+                (domain_logits.shape[0],)
+                + (1,) * (domain_logits.ndim - 1)
+            )
+        try:
+            valid = valid.expand_as(domain_logits)
+        except RuntimeError as error:
+            raise ValueError(
+                "valid_mask is not broadcastable to domain_logits"
+            ) from error
+
+    valid_count = int(valid.sum().item())
+    if not valid_count:
+        zero = domain_logits.sum() * 0.0
+        return zero, domain_logits.new_tensor(float("nan")), 0
+
+    loss = F.binary_cross_entropy_with_logits(
+        domain_logits[valid], labels[valid]
+    )
+    predictions = (domain_logits[valid] >= 0).to(labels.dtype)
+    accuracy = (predictions == labels[valid]).float().mean()
+    return loss, accuracy, valid_count
+
+
+def single_domain_entropy_weighted_loss(
+    domain_logits: torch.Tensor,
+    attention: torch.Tensor,
+    domain_label: float,
+    scene_indices: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """Return one domain's half of the SSDA alignment objective."""
+
+    if domain_label not in (0.0, 1.0):
+        raise ValueError("domain_label must be either 0 or 1")
+    if domain_logits.ndim == 0 or domain_logits.shape[0] == 0:
+        raise ValueError("domain_logits must have a non-empty batch dimension")
+    if scene_indices is not None:
+        scene_indices = scene_indices.reshape(-1)
+        if scene_indices.numel() != domain_logits.shape[0]:
+            raise ValueError("scene_indices must match the first logit dimension")
+
+    labels = torch.full_like(domain_logits, float(domain_label))
+    weights = attention.to(
+        device=domain_logits.device, dtype=domain_logits.dtype
+    )
+    try:
+        weights = weights.expand_as(domain_logits)
+    except RuntimeError as error:
+        raise ValueError(
+            "attention is not broadcastable to domain_logits"
+        ) from error
+    if bool((weights < 0).any().item()):
+        raise ValueError("SSDA attention weights must be non-negative")
+
+    denominator = weights.sum()
+    valid_count = int(domain_logits.numel())
+    if float(denominator.detach().item()) <= 0:
+        zero = domain_logits.sum() * 0.0
+        return zero, domain_logits.new_tensor(float("nan")), valid_count
+
+    per_element = F.binary_cross_entropy_with_logits(
+        domain_logits, labels, reduction="none"
+    )
+    loss = (per_element * weights).sum() / denominator
+    predictions = (domain_logits >= 0).to(labels.dtype)
+    accuracy = (
+        (predictions == labels).to(weights.dtype) * weights
+    ).sum() / denominator
+    return loss, accuracy, valid_count
+
+
+def single_domain_graph_variance_loss(
+    graph_embedding: torch.Tensor,
+    valid_graph_mask: torch.Tensor,
+    target_std: float,
+    enabled: bool,
+    epsilon: float = 1.0e-8,
+) -> torch.Tensor:
+    """Return one domain's contribution to the IADA variance floor."""
+
+    valid = valid_graph_mask.reshape(-1).to(
+        device=graph_embedding.device, dtype=torch.bool
+    )
+    selected = graph_embedding[valid]
+    if not enabled or target_std <= 0 or selected.shape[0] < 2:
+        return graph_embedding.sum() * 0.0
+    standard_deviation = torch.sqrt(
+        selected.var(dim=0, unbiased=False).mean() + epsilon
+    )
+    return 0.5 * F.relu(target_std - standard_deviation)
+
+
 def dusa_agent_loss(
     agent_logits: torch.Tensor,
     confidence_weights: torch.Tensor,
@@ -542,11 +664,222 @@ def compute_adaptation_loss(
     raise ValueError(f"Unsupported domain adaptation method: {method!r}")
 
 
+def compute_single_domain_adaptation_loss(
+    method: str,
+    domain: str,
+    output_dict: Mapping[str, torch.Tensor],
+    record_len: torch.Tensor,
+    source_label_dict: Optional[Mapping[str, torch.Tensor]],
+    config: Mapping[str, object],
+    *,
+    iada_domain_enabled: bool = True,
+    iada_variance_enabled: bool = False,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Compute one domain's contribution to a balanced DA objective.
+
+    Source and target contributions include their ``0.5`` balance factor, so
+    summing the two returned losses is equivalent to
+    :func:`compute_adaptation_loss`.  Source-only and target-only auxiliary
+    terms (CUDA-X BLC bins and DUSA CIA respectively) retain their full weight.
+    """
+
+    if domain not in ("source", "target"):
+        raise ValueError("domain must be either 'source' or 'target'")
+    domain_label = 0.0 if domain == "source" else 1.0
+    method = method.lower().replace("-", "").replace("_", "")
+    metrics: Dict[str, torch.Tensor] = {}
+
+    if method in ("grl", "discriminator", "naive"):
+        loss, accuracy, valid_count = single_domain_loss(
+            output_dict["domain_logits"],
+            domain_label,
+            output_dict.get("domain_scene_index"),
+            output_dict.get("domain_valid_mask"),
+        )
+        contribution = 0.5 * loss
+        metrics.update(
+            domain_loss=contribution,
+            domain_accuracy=accuracy,
+            valid_domain_count=loss.new_tensor(valid_count),
+        )
+        return (
+            float(config.get("domain_loss_weight", 0.1)) * contribution,
+            metrics,
+        )
+
+    if method == "dusa":
+        lsa_loss, lsa_accuracy, lsa_count = single_domain_loss(
+            output_dict["domain_logits"],
+            domain_label,
+            output_dict.get("domain_scene_index"),
+            output_dict.get("domain_valid_mask"),
+        )
+        lsa_contribution = 0.5 * lsa_loss
+        if domain == "target":
+            target_labels = torch.ones(
+                len(record_len), device=lsa_loss.device
+            )
+            cia_loss, cia_accuracy, cia_count = dusa_agent_loss(
+                output_dict["agent_domain_logits"],
+                output_dict["agent_domain_weights"],
+                output_dict["agent_scene_index"],
+                output_dict["agent_local_index"],
+                target_labels,
+                record_len,
+            )
+        else:
+            cia_loss = lsa_loss.new_zeros(())
+            cia_accuracy = lsa_loss.new_tensor(float("nan"))
+            cia_count = 0
+        metrics.update(
+            domain_loss=lsa_contribution + cia_loss,
+            domain_accuracy=lsa_accuracy,
+            lsa_loss=lsa_contribution,
+            lsa_accuracy=lsa_accuracy,
+            lsa_valid_count=lsa_loss.new_tensor(lsa_count),
+            cia_loss=cia_loss,
+            cia_accuracy=cia_accuracy,
+            cia_valid_count=lsa_loss.new_tensor(cia_count),
+        )
+        return (
+            float(config.get("dusa_lsa_weight", 1.0)) * lsa_contribution
+            + float(config.get("dusa_cia_weight", 1.0)) * cia_loss,
+            metrics,
+        )
+
+    if method == "cudax":
+        domain_losses = []
+        domain_accuracies = []
+        for name in ("ckt", "blc", "cpa"):
+            loss, accuracy, valid_count = single_domain_loss(
+                output_dict[f"{name}_domain_logits"],
+                domain_label,
+                output_dict.get("domain_scene_index"),
+                output_dict.get("domain_valid_mask"),
+            )
+            contribution = 0.5 * loss
+            metrics[f"{name}_domain_loss"] = contribution
+            metrics[f"{name}_domain_accuracy"] = accuracy
+            metrics[f"{name}_valid_count"] = loss.new_tensor(valid_count)
+            domain_losses.append(contribution)
+            domain_accuracies.append(accuracy)
+        domain_loss = torch.stack(domain_losses).sum()
+        domain_accuracy = torch.stack(domain_accuracies).nanmean()
+
+        if domain == "source":
+            if source_label_dict is None:
+                raise ValueError("CUDA-X source loss requires source labels")
+            residual_bounds = config.get("cudax_residual_bounds")
+            if residual_bounds is None or len(residual_bounds) != 6:
+                raise ValueError(
+                    "CUDA-X requires six source-only cudax_residual_bounds in "
+                    "encoded [x, y, z, h, w, l] order"
+                )
+            bin_loss = cudax_bin_loss(
+                output_dict["bin_logits"],
+                source_label_dict,
+                int(config.get("cudax_bin_count", 5)),
+                residual_bounds,
+            )
+        else:
+            bin_loss = domain_loss.new_zeros(())
+        metrics.update(
+            domain_loss=domain_loss,
+            domain_accuracy=domain_accuracy,
+            bin_loss=bin_loss,
+        )
+        return (
+            float(config.get("cudax_bin_loss_weight", 0.1)) * bin_loss
+            + float(config.get("cudax_domain_loss_weight", 0.1))
+            * domain_loss,
+            metrics,
+        )
+
+    if method == "iada":
+        domain_loss, domain_accuracy, valid_count = single_domain_loss(
+            output_dict["domain_logits"],
+            domain_label,
+            output_dict.get("domain_scene_index"),
+            output_dict.get("domain_valid_mask"),
+        )
+        if not iada_domain_enabled:
+            domain_loss = output_dict["domain_logits"].sum() * 0.0
+            domain_accuracy = domain_loss.new_tensor(float("nan"))
+        domain_contribution = 0.5 * domain_loss
+        variance_loss = single_domain_graph_variance_loss(
+            output_dict["graph_embedding"],
+            output_dict["valid_graph_mask"],
+            float(config.get("graph_variance_target_std", 0.0)),
+            iada_variance_enabled,
+        )
+        metrics.update(
+            domain_loss=domain_contribution,
+            domain_accuracy=domain_accuracy,
+            valid_domain_count=domain_loss.new_tensor(valid_count),
+            graph_variance_loss=variance_loss,
+            graph_variance_update_applied=domain_loss.new_tensor(
+                int(iada_variance_enabled)
+            ),
+        )
+        return (
+            float(config.get("domain_loss_weight", 0.1))
+            * domain_contribution
+            + float(config.get("graph_variance_weight", 0.0))
+            * variance_loss,
+            metrics,
+        )
+
+    if method == "ssda":
+        global_loss, global_accuracy, global_count = (
+            single_domain_entropy_weighted_loss(
+                output_dict["ssda_global_logits"],
+                output_dict["ssda_global_attention"],
+                domain_label,
+                output_dict.get("ssda_global_scene_index"),
+            )
+        )
+        local_loss, local_accuracy, local_count = (
+            single_domain_entropy_weighted_loss(
+                output_dict["ssda_local_logits"],
+                output_dict["ssda_local_attention"],
+                domain_label,
+                output_dict.get("ssda_local_scene_index"),
+            )
+        )
+        global_contribution = 0.5 * global_loss
+        local_contribution = 0.5 * local_loss
+        metrics.update(
+            domain_loss=global_contribution + local_contribution,
+            domain_accuracy=torch.stack(
+                (global_accuracy, local_accuracy)
+            ).nanmean(),
+            ssda_global_loss=global_contribution,
+            ssda_global_accuracy=global_accuracy,
+            ssda_global_valid_count=global_loss.new_tensor(global_count),
+            ssda_local_loss=local_contribution,
+            ssda_local_accuracy=local_accuracy,
+            ssda_local_valid_count=local_loss.new_tensor(local_count),
+        )
+        return (
+            float(config.get("ssda_global_weight", 0.5))
+            * global_contribution
+            + float(config.get("ssda_local_weight", 1.0))
+            * local_contribution,
+            metrics,
+        )
+
+    raise ValueError(f"Unsupported domain adaptation method: {method!r}")
+
+
 __all__ = [
     "balanced_domain_loss",
     "compute_adaptation_loss",
+    "compute_single_domain_adaptation_loss",
     "cudax_bin_loss",
     "dusa_agent_loss",
     "entropy_weighted_domain_loss",
     "graph_variance_floor_loss",
+    "single_domain_entropy_weighted_loss",
+    "single_domain_graph_variance_loss",
+    "single_domain_loss",
 ]

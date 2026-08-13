@@ -195,8 +195,15 @@ class PointPillarBaseline(nn.Module):
             output_dict.update({'dir_preds': self.dir_head(fused_feature)})
 
         if self.domain_adapter is not None:
+            adapter_domain = data_dict.get('adapter_domain')
             agent_confidence_logits = None
-            if self.domain_adapter.requires_agent_confidence:
+            needs_confidence = self.domain_adapter.requires_agent_confidence
+            if (
+                self.domain_adapter.method == 'dusa'
+                and adapter_domain == 'source'
+            ):
+                needs_confidence = False
+            if needs_confidence:
                 agent_confidence_logits = self.cls_head(agent_features)
             output_dict.update(
                 self.domain_adapter(
@@ -209,6 +216,7 @@ class PointPillarBaseline(nn.Module):
                     fused_class_logits=psm,
                     context=adaptation_context,
                     detection_features=fused_feature,
+                    adapter_domain=adapter_domain,
                 )
             )
 

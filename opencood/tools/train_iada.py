@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 import opencood.hypes_yaml.yaml_utils as yaml_utils
 from opencood.loss.domain_adaptation_loss import (
     balanced_domain_loss as _generic_balanced_domain_loss,
-    compute_adaptation_loss,
+    compute_single_domain_adaptation_loss,
     graph_variance_floor_loss as _generic_graph_variance_floor_loss,
 )
 from opencood.tools import train_utils
@@ -597,6 +597,57 @@ def _merge_domain_outputs(
     return merged
 
 
+def _detach_metrics(metrics):
+    """Detach scalar metrics before their domain graph is released."""
+
+    return {
+        key: value.detach() if torch.is_tensor(value) else value
+        for key, value in metrics.items()
+    }
+
+
+def _combine_domain_metrics(source_metrics, target_metrics):
+    """Reconstruct joint-batch metrics from sequential domain forwards."""
+
+    combined = {}
+    for key in set(source_metrics) | set(target_metrics):
+        values = [
+            metrics[key]
+            for metrics in (source_metrics, target_metrics)
+            if key in metrics
+        ]
+        tensor_values = [value for value in values if torch.is_tensor(value)]
+        if not tensor_values:
+            continue
+        if "accuracy" in key:
+            combined[key] = torch.stack(tensor_values).nanmean()
+        elif key == "graph_variance_update_applied":
+            combined[key] = torch.stack(tensor_values).amin()
+        else:
+            combined[key] = torch.stack(tensor_values).sum()
+    return combined
+
+
+def _iada_variance_is_enabled(
+    source_record_len, target_record_len, target_std
+):
+    """Match the joint IADA variance gate without retaining both graphs."""
+
+    return (
+        float(target_std) > 0
+        and int((source_record_len > 1).sum().item()) >= 2
+        and int((target_record_len > 1).sum().item()) >= 2
+    )
+
+
+def _iada_domain_is_enabled(source_record_len, target_record_len):
+    """Match balanced_domain_loss's two-sided valid-domain requirement."""
+
+    return bool((source_record_len > 1).any().item()) and bool(
+        (target_record_len > 1).any().item()
+    )
+
+
 def _slice_detection_output(output_dict, source_scene_count):
     detection_output = {}
     for key in DETECTION_OUTPUT_KEYS:
@@ -1047,21 +1098,21 @@ def main():
                 source_scene_count = int(
                     source_ego["record_len"].numel()
                 )
-                target_scene_count = int(
-                    target_ego["record_len"].numel()
+                iada_variance_enabled = _iada_variance_is_enabled(
+                    source_ego["record_len"],
+                    target_ego["record_len"],
+                    da_cfg.get("graph_variance_target_std", 0.0),
                 )
-                domain_labels = torch.cat(
-                    (
-                        torch.zeros(source_scene_count),
-                        torch.ones(target_scene_count),
-                    )
+                iada_domain_enabled = _iada_domain_is_enabled(
+                    source_ego["record_len"], target_ego["record_len"]
                 )
             else:
                 source_model_inputs = _select_model_inputs(source_ego)
                 source_scene_count = int(
                     source_ego["record_len"].numel()
                 )
-                domain_labels = None
+                iada_variance_enabled = False
+                iada_domain_enabled = False
 
             global_step = epoch * steps_per_epoch + step
             current_grl = (
@@ -1079,16 +1130,16 @@ def main():
                 source_model_inputs, device
             )
             source_model_inputs["grl_lambda"] = current_grl
+            source_model_inputs["adapter_domain"] = "source"
             if use_target:
                 target_model_inputs = train_utils.to_device(
                     target_model_inputs, device
                 )
                 target_model_inputs["grl_lambda"] = current_grl
+                target_model_inputs["adapter_domain"] = "target"
             source_label_dict = train_utils.to_device(
                 source_ego["label_dict"], device
             )
-            if domain_labels is not None:
-                domain_labels = domain_labels.to(device)
 
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=amp_enabled):
@@ -1099,55 +1150,97 @@ def main():
                 detection_loss = criterion(
                     detection_output, source_label_dict
                 )
-
                 if use_target:
-                    target_output = model(target_model_inputs)
-                    output_dict = _merge_domain_outputs(
-                        source_output,
-                        target_output,
-                        source_scene_count,
-                    )
-                    record_len = torch.cat(
-                        (
-                            source_model_inputs["record_len"],
-                            target_model_inputs["record_len"],
-                        )
-                    )
-                    adaptation_loss, adaptation_metrics = (
-                        compute_adaptation_loss(
+                    source_adaptation_loss, source_metrics = (
+                        compute_single_domain_adaptation_loss(
                             stage,
-                            output_dict,
-                            domain_labels,
-                            source_scene_count,
-                            record_len,
+                            "source",
+                            source_output,
+                            source_model_inputs["record_len"],
                             source_label_dict,
                             da_cfg,
+                            iada_domain_enabled=iada_domain_enabled,
+                            iada_variance_enabled=iada_variance_enabled,
                         )
                     )
-                    domain_loss = adaptation_metrics.get(
-                        "domain_loss", adaptation_loss
-                    )
-                    domain_accuracy = adaptation_metrics.get(
-                        "domain_accuracy",
-                        detection_loss.new_tensor(float("nan")),
-                    )
-                    total_loss = detection_loss + adaptation_loss
-                    if "graph_embedding" in output_dict:
-                        graph_embedding = output_dict["graph_embedding"]
-                        adaptation_metrics["graph_embedding_norm"] = (
-                            graph_embedding.norm(dim=1).mean()
+                    if "graph_embedding" in source_output:
+                        source_graph = source_output["graph_embedding"]
+                        source_metrics["graph_embedding_norm"] = (
+                            0.5 * source_graph.norm(dim=1).mean()
                         )
-                        adaptation_metrics["graph_embedding_variance"] = (
-                            graph_embedding.var(dim=0, unbiased=False).mean()
+                        source_metrics["graph_embedding_variance"] = (
+                            0.5
+                            * source_graph.var(
+                                dim=0, unbiased=False
+                            ).mean()
                         )
                 else:
-                    adaptation_loss = detection_loss.new_zeros(())
-                    adaptation_metrics = {}
-                    domain_loss = adaptation_loss
-                    domain_accuracy = detection_loss.new_tensor(float("nan"))
-                    total_loss = detection_loss
+                    source_adaptation_loss = detection_loss.new_zeros(())
+                    source_metrics = {}
+                source_total_loss = detection_loss + source_adaptation_loss
 
-            scaler.scale(total_loss).backward()
+            # Backpropagate the source contribution before constructing the
+            # target graph. Gradients remain accumulated until the single
+            # optimizer step below, while the large source activations can be
+            # released before target V2X-ViT attention runs.
+            scaler.scale(source_total_loss).backward()
+            detection_loss = detection_loss.detach()
+            source_adaptation_loss = source_adaptation_loss.detach()
+            source_metrics = _detach_metrics(source_metrics)
+            del detection_output, source_output, source_total_loss
+
+            if use_target:
+                with torch.amp.autocast("cuda", enabled=amp_enabled):
+                    target_output = model(target_model_inputs)
+                    target_adaptation_loss, target_metrics = (
+                        compute_single_domain_adaptation_loss(
+                            stage,
+                            "target",
+                            target_output,
+                            target_model_inputs["record_len"],
+                            None,
+                            da_cfg,
+                            iada_domain_enabled=iada_domain_enabled,
+                            iada_variance_enabled=iada_variance_enabled,
+                        )
+                    )
+                    if "graph_embedding" in target_output:
+                        target_graph = target_output["graph_embedding"]
+                        target_metrics["graph_embedding_norm"] = (
+                            0.5 * target_graph.norm(dim=1).mean()
+                        )
+                        target_metrics["graph_embedding_variance"] = (
+                            0.5
+                            * target_graph.var(
+                                dim=0, unbiased=False
+                            ).mean()
+                        )
+
+                scaler.scale(target_adaptation_loss).backward()
+                target_adaptation_loss = target_adaptation_loss.detach()
+                target_metrics = _detach_metrics(target_metrics)
+                del target_output
+
+                adaptation_loss = (
+                    source_adaptation_loss + target_adaptation_loss
+                )
+                adaptation_metrics = _combine_domain_metrics(
+                    source_metrics, target_metrics
+                )
+                domain_loss = adaptation_metrics.get(
+                    "domain_loss", adaptation_loss
+                )
+                domain_accuracy = adaptation_metrics.get(
+                    "domain_accuracy",
+                    detection_loss.new_tensor(float("nan")),
+                )
+                total_loss = detection_loss + adaptation_loss
+            else:
+                adaptation_loss = source_adaptation_loss
+                adaptation_metrics = source_metrics
+                domain_loss = adaptation_loss
+                domain_accuracy = detection_loss.new_tensor(float("nan"))
+                total_loss = detection_loss
             if gradient_clip > 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(

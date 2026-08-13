@@ -183,6 +183,7 @@ class FusionAgnosticDomainAdapter(nn.Module):
         fused_class_logits: Optional[torch.Tensor] = None,
         context: Optional[Dict[str, torch.Tensor]] = None,
         detection_features: Optional[torch.Tensor] = None,
+        adapter_domain: Optional[str] = None,
     ) -> Dict[str, torch.Tensor]:
         raise NotImplementedError
 
@@ -209,6 +210,7 @@ class NaiveDomainAdapter(FusionAgnosticDomainAdapter):
         fused_class_logits: Optional[torch.Tensor] = None,
         context: Optional[Dict[str, torch.Tensor]] = None,
         detection_features: Optional[torch.Tensor] = None,
+        adapter_domain: Optional[str] = None,
     ) -> Dict[str, torch.Tensor]:
         scene_indices, _ = scene_and_local_indices(
             record_len, agent_features.device
@@ -325,10 +327,14 @@ class DUSAAdapter(FusionAgnosticDomainAdapter):
         fused_class_logits: Optional[torch.Tensor] = None,
         context: Optional[Dict[str, torch.Tensor]] = None,
         detection_features: Optional[torch.Tensor] = None,
+        adapter_domain: Optional[str] = None,
     ) -> Dict[str, torch.Tensor]:
-        if agent_confidence_logits is None:
+        if adapter_domain != "source" and agent_confidence_logits is None:
             raise ValueError("DUSA requires per-agent confidence logits")
-        if agent_confidence_logits.shape[0] != agent_features.shape[0]:
+        if (
+            agent_confidence_logits is not None
+            and agent_confidence_logits.shape[0] != agent_features.shape[0]
+        ):
             raise ValueError("DUSA confidence and feature agent counts differ")
 
         coordinates = _coordinate_encoding(agent_features, self.lidar_range)
@@ -349,6 +355,20 @@ class DUSAAdapter(FusionAgnosticDomainAdapter):
             dim=(-2, -1)
         )
 
+        lsa_output = {
+            "domain_logits": self.sim_real_discriminator(selected_ego),
+            "domain_scene_index": torch.arange(
+                len(record_len), device=agent_features.device
+            ),
+            "domain_valid_mask": torch.ones(
+                len(record_len),
+                dtype=torch.bool,
+                device=agent_features.device,
+            ),
+        }
+        if adapter_domain == "source":
+            return lsa_output
+
         reversed_agent_features = self.gradient_reversal(
             torch.cat((agent_features, coordinates), dim=1),
             coefficient=self.cia_grl_scale,
@@ -358,13 +378,7 @@ class DUSAAdapter(FusionAgnosticDomainAdapter):
             record_len, agent_features.device
         )
         return {
-            "domain_logits": self.sim_real_discriminator(selected_ego),
-            "domain_scene_index": torch.arange(
-                len(record_len), device=agent_features.device
-            ),
-            "domain_valid_mask": torch.ones(
-                len(record_len), dtype=torch.bool, device=agent_features.device
-            ),
+            **lsa_output,
             "agent_domain_logits": agent_logits,
             "agent_domain_weights": self._confidence_weights(
                 agent_confidence_logits, record_len
@@ -407,6 +421,7 @@ class IADAAdapter(FusionAgnosticDomainAdapter):
         fused_class_logits: Optional[torch.Tensor] = None,
         context: Optional[Dict[str, torch.Tensor]] = None,
         detection_features: Optional[torch.Tensor] = None,
+        adapter_domain: Optional[str] = None,
     ) -> Dict[str, torch.Tensor]:
         graph_output = self.interaction_adapter(
             agent_features,
@@ -827,6 +842,7 @@ class SSDAAdapter(FusionAgnosticDomainAdapter):
         fused_class_logits: Optional[torch.Tensor] = None,
         context: Optional[Dict[str, torch.Tensor]] = None,
         detection_features: Optional[torch.Tensor] = None,
+        adapter_domain: Optional[str] = None,
     ) -> Dict[str, torch.Tensor]:
         if agent_confidence_logits is None:
             raise ValueError("SSDA requires per-agent classification logits")
@@ -1035,6 +1051,7 @@ class CUDAXAdapter(FusionAgnosticDomainAdapter):
         fused_class_logits: Optional[torch.Tensor] = None,
         context: Optional[Dict[str, torch.Tensor]] = None,
         detection_features: Optional[torch.Tensor] = None,
+        adapter_domain: Optional[str] = None,
     ) -> Dict[str, torch.Tensor]:
         if fused_class_logits is None:
             raise ValueError("CUDA-X CPA requires fused classification logits")
@@ -1054,7 +1071,6 @@ class CUDAXAdapter(FusionAgnosticDomainAdapter):
                 "CUDA-X CPA classification channels must equal anchor_number"
             )
 
-        bin_features = self.bin_features(detection_features)
         reversed_detection_features = self.blc_gradient_reversal(
             detection_features, coefficient=grl_lambda
         )
@@ -1077,16 +1093,22 @@ class CUDAXAdapter(FusionAgnosticDomainAdapter):
         valid = torch.ones(
             batch_size, dtype=torch.bool, device=fused_features.device
         )
-        return {
+        output = {
             "ckt_domain_logits": context["ckt_domain_logits"],
             "blc_domain_logits": self.blc_discriminator(
                 reversed_detection_features
             ),
-            "cpa_domain_logits": self.cpa_discriminator(cpa_features).squeeze(-1),
-            "bin_logits": self.bin_head(bin_features),
+            "cpa_domain_logits": self.cpa_discriminator(
+                cpa_features
+            ).squeeze(-1),
             "domain_scene_index": scene_indices,
             "domain_valid_mask": valid,
         }
+        if adapter_domain != "target":
+            output["bin_logits"] = self.bin_head(
+                self.bin_features(detection_features)
+            )
+        return output
 
 
 def build_domain_adapter(

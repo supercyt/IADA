@@ -10,6 +10,7 @@ import torch.nn as nn
 from opencood.loss.domain_adaptation_loss import (
     balanced_domain_loss,
     compute_adaptation_loss,
+    compute_single_domain_adaptation_loss,
     cudax_bin_loss,
     dusa_agent_loss,
     entropy_weighted_domain_loss,
@@ -237,6 +238,31 @@ class AdapterForwardTest(unittest.TestCase):
         )
         self.assertFalse(output["agent_domain_weights"].requires_grad)
 
+    def test_dusa_source_skips_target_only_cia_branch(self):
+        agent_features, fused_features, record_len, pairwise = (
+            _adapter_inputs()
+        )
+        adapter = DUSAAdapter(
+            in_channels=4,
+            lsa_hidden_dim=4,
+            cia_hidden_dim=4,
+            lidar_range=(-2, -2, -1, 2, 2, 1),
+            feature_size=(2, 2),
+        ).eval()
+
+        output = adapter(
+            agent_features,
+            fused_features,
+            record_len,
+            pairwise,
+            grl_lambda=0.5,
+            adapter_domain="source",
+        )
+
+        self.assertIn("domain_logits", output)
+        self.assertNotIn("agent_domain_logits", output)
+        self.assertNotIn("agent_domain_weights", output)
+
     def test_dusa_reverses_backbone_but_not_location_selector_gradient(self):
         agent_features = torch.ones(2, 2, 2, 2, requires_grad=True)
         record_len = torch.tensor([2])
@@ -386,8 +412,169 @@ class AdapterForwardTest(unittest.TestCase):
         self.assertIsNotNone(fused_class_logits.grad)
         self.assertTrue(torch.isfinite(fused_class_logits.grad).all().item())
 
+    def test_cudax_target_skips_source_only_bin_branch(self):
+        agent_features, fused_features, record_len, pairwise = (
+            _adapter_inputs()
+        )
+        adapter = CUDAXAdapter(
+            in_channels=4,
+            detection_channels=4,
+            anchor_number=2,
+            hidden_dim=4,
+            discriminator_hidden_dim=4,
+            ckt_groups=2,
+            bin_count=3,
+            feature_size=(2, 2),
+            cpa_hidden_dim=4,
+        )
+        adapted_features, context = adapter.adapt_fused(
+            agent_features, fused_features, record_len, grl_lambda=0.5
+        )
+
+        output = adapter(
+            agent_features,
+            adapted_features,
+            record_len,
+            pairwise,
+            grl_lambda=0.5,
+            fused_class_logits=torch.randn(2, 2, 2, 2),
+            context=context,
+            detection_features=adapted_features,
+            adapter_domain="target",
+        )
+
+        self.assertNotIn("bin_logits", output)
+        self.assertIn("ckt_domain_logits", output)
+        self.assertIn("blc_domain_logits", output)
+        self.assertIn("cpa_domain_logits", output)
+
 
 class AdaptationLossTest(unittest.TestCase):
+    def test_sequential_grl_gradients_match_joint_backward(self):
+        source_logits = torch.randn(3, 1, requires_grad=True)
+        target_logits = torch.randn(2, 1, requires_grad=True)
+        config = {"domain_loss_weight": 0.3}
+        joint_loss, _ = compute_adaptation_loss(
+            "grl",
+            {
+                "domain_logits": torch.cat(
+                    (source_logits, target_logits), dim=0
+                ),
+                "domain_scene_index": torch.arange(5),
+                "domain_valid_mask": torch.ones(5, dtype=torch.bool),
+            },
+            torch.tensor([0.0, 0.0, 0.0, 1.0, 1.0]),
+            source_scene_count=3,
+            record_len=torch.ones(5, dtype=torch.long),
+            source_label_dict={},
+            config=config,
+        )
+        joint_gradients = torch.autograd.grad(
+            joint_loss, (source_logits, target_logits), retain_graph=True
+        )
+
+        source_loss, _ = compute_single_domain_adaptation_loss(
+            "grl",
+            "source",
+            {
+                "domain_logits": source_logits,
+                "domain_scene_index": torch.arange(3),
+                "domain_valid_mask": torch.ones(3, dtype=torch.bool),
+            },
+            torch.ones(3, dtype=torch.long),
+            {},
+            config,
+        )
+        target_loss, _ = compute_single_domain_adaptation_loss(
+            "grl",
+            "target",
+            {
+                "domain_logits": target_logits,
+                "domain_scene_index": torch.arange(2),
+                "domain_valid_mask": torch.ones(2, dtype=torch.bool),
+            },
+            torch.ones(2, dtype=torch.long),
+            None,
+            config,
+        )
+        sequential_gradients = torch.autograd.grad(
+            source_loss + target_loss, (source_logits, target_logits)
+        )
+
+        for sequential, joint in zip(sequential_gradients, joint_gradients):
+            torch.testing.assert_close(sequential, joint)
+
+    def test_sequential_cudax_loss_matches_joint_domain_loss(self):
+        torch.manual_seed(91)
+        source = {
+            "ckt_domain_logits": torch.randn(1, 1),
+            "blc_domain_logits": torch.randn(1, 1, 2, 2),
+            "cpa_domain_logits": torch.randn(1, 2),
+            "bin_logits": torch.randn(1, 24, 2, 2),
+            "domain_scene_index": torch.tensor([0]),
+            "domain_valid_mask": torch.ones(1, dtype=torch.bool),
+        }
+        target = {
+            "ckt_domain_logits": torch.randn(1, 1),
+            "blc_domain_logits": torch.randn(1, 1, 2, 2),
+            "cpa_domain_logits": torch.randn(1, 2),
+            "domain_scene_index": torch.tensor([0]),
+            "domain_valid_mask": torch.ones(1, dtype=torch.bool),
+        }
+        joint = {
+            key: torch.cat((source[key], target[key]), dim=0)
+            for key in (
+                "ckt_domain_logits",
+                "blc_domain_logits",
+                "cpa_domain_logits",
+                "domain_valid_mask",
+            )
+        }
+        joint["domain_scene_index"] = torch.arange(2)
+        joint["bin_logits"] = torch.cat(
+            (source["bin_logits"], torch.randn_like(source["bin_logits"])),
+            dim=0,
+        )
+        source_targets = {
+            "targets": torch.zeros(1, 2, 2, 14),
+            "pos_equal_one": torch.zeros(1, 2, 2, 2),
+        }
+        source_targets["pos_equal_one"][0, 0, 0, 0] = 1
+        config = {
+            "cudax_bin_count": 2,
+            "cudax_residual_bounds": [1.0] * 6,
+            "cudax_bin_loss_weight": 0.25,
+            "cudax_domain_loss_weight": 0.1,
+        }
+
+        joint_loss, _ = compute_adaptation_loss(
+            "cudax",
+            joint,
+            torch.tensor([0.0, 1.0]),
+            source_scene_count=1,
+            record_len=torch.tensor([2, 2]),
+            source_label_dict=source_targets,
+            config=config,
+        )
+        source_loss, _ = compute_single_domain_adaptation_loss(
+            "cudax",
+            "source",
+            source,
+            torch.tensor([2]),
+            source_targets,
+            config,
+        )
+        target_loss, _ = compute_single_domain_adaptation_loss(
+            "cudax",
+            "target",
+            target,
+            torch.tensor([2]),
+            None,
+            config,
+        )
+
+        torch.testing.assert_close(source_loss + target_loss, joint_loss)
+
     def test_entropy_weighted_domain_loss_balances_source_and_target(self):
         logits = torch.zeros(3, 1, 2, 2, requires_grad=True)
         attention = torch.tensor([1.0, 0.5, 0.25]).reshape(3, 1, 1, 1)
