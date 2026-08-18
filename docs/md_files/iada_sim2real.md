@@ -95,7 +95,9 @@ The five accepted stages are:
   vehicle/infrastructure alignment.
 - `cudax`: the repository's paper-based reproduction of CUDA-X CKT, BLC, and
   CPA.
-- `iada`: interaction-graph domain alignment.
+- `iada`: interventional collaboration-advantage adaptation. It compares the
+  native collaborative prediction with an ego-only counterfactual and does
+  not use a graph/domain discriminator.
 
 DUSA uses its paper coefficients `0.05` for LSA and `0.1` for CIA directly;
 they are fixed adversarial scales and are not multiplied by the global GRL
@@ -112,19 +114,70 @@ contains the model, optimizer, scheduler, scaler, random state, and checkpoint
 selection state; the `net_epoch*.pth` files remain model-only inference
 checkpoints.
 
+## Incremental IADA configurations
+
+The four AttFuse IADA files use `base_config` inheritance, so the dataset,
+detector, optimizer, and protocol remain defined in the main YAML, while
+`pointpillar_attfuse_iada_common.yaml` stores the shared stage and baseline
+checkpoint. Each experiment file progressively enables another part of the
+same method:
+
+| Configuration | Utility gate | Source safe/correction/utility | Target intervention consistency | Effect memory |
+| --- | --- | --- | --- | --- |
+| `pointpillar_attfuse_iada_gate.yaml` | yes | no | no | no |
+| `pointpillar_attfuse_iada_source.yaml` | yes | yes | no | no |
+| `pointpillar_attfuse_iada_consistency.yaml` | yes | yes | yes | no |
+| `pointpillar_attfuse_iada_full.yaml` | yes | yes | yes | yes |
+
+Every incremental config sets `stage: iada` and contains the current matching
+baseline path. Run it without changing command-line stages:
+
+```bash
+python opencood/tools/train_iada.py -y \
+  opencood/hypes_yaml/domain_adaptation/opv2v_to_dair/pointpillar_attfuse_iada_gate.yaml
+
+python opencood/tools/train_iada.py -y \
+  opencood/hypes_yaml/domain_adaptation/opv2v_to_dair/pointpillar_attfuse_iada_source.yaml
+
+python opencood/tools/train_iada.py -y \
+  opencood/hypes_yaml/domain_adaptation/opv2v_to_dair/pointpillar_attfuse_iada_consistency.yaml
+
+python opencood/tools/train_iada.py -y \
+  opencood/hypes_yaml/domain_adaptation/opv2v_to_dair/pointpillar_attfuse_iada_full.yaml
+```
+
+These runs are cumulative *module ablations* but independently warm-start from
+the same source-only AttFuse baseline. Do not warm-start one ablation from a
+different IADA ablation, because that would confound module gains with extra
+optimization epochs. When a new baseline is trained, only update
+`domain_adaptation.pretrained_model_dir` in
+`pointpillar_attfuse_iada_common.yaml`.
+
+The source stage uses OPV2V labels to supervise non-degradation, continuous
+box correction, and signed collaboration utility. The target stage never
+receives DAIR labels: it compares a channel-dropout intervention view against
+an EMA copy of the utility gate, and aligns reliable effect tokens to
+source-only discovery, suppression, and refinement prototypes grouped into
+near/middle/far relative-geometry contexts.
+
 ## Unified adapter and removed interaction logits
 
 Domain adaptation is attached after the existing encoder and native fusion
-module. It consumes common per-agent, fused, detection, and classification
-features and emits auxiliary losses only. It does not replace AttFuse weights
-or inject an adaptation score into any fusion method.
+module. GRL, DUSA, and CUDA-X retain the comparison implementation described
+above. IADA additionally extracts the first agent as an ego-only
+counterfactual and applies a bounded residual gate:
 
-`interaction_logits`, the old IADA fusion prior, and the old `iada_v1` /
-`iada_v2` stage split have been removed. IADA is now one graph-alignment stage,
-which makes the same implementation usable with AttFuse, DiscoNet, and
-V2X-ViT. Checkpoints or optimizer states containing the removed score head are
-not valid exact-resume checkpoints for the new protocol; start from the
-matching source-only baseline.
+`F_calibrated = F_ego + gate * (F_fused - F_ego)`.
+
+The gate head is zero-initialized, so `gate == 1` and the first forward exactly
+matches native fusion. At inference the calibrated feature is passed through
+the unchanged PointPillar heads; teacher/intervention views and effect-memory
+losses are training-only.
+
+`interaction_logits`, the old graph-domain discriminator, graph variance
+floor, and the old `iada_v1` / `iada_v2` stage split have been removed.
+Checkpoints from graph-based IADA are not compatible exact-resume checkpoints;
+start the new method from the matching source-only baseline.
 
 ## CUDA-X residual bounds
 

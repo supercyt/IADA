@@ -17,6 +17,7 @@ AttFuse-specific API.
 
 from __future__ import annotations
 
+import copy
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -26,7 +27,6 @@ from torch.utils.checkpoint import checkpoint
 
 from opencood.models.sub_modules.interaction_da import (
     GradientReversal,
-    InteractionDomainAdapter,
 )
 
 
@@ -169,6 +169,8 @@ class FusionAgnosticDomainAdapter(nn.Module):
         fused_features: torch.Tensor,
         record_len: torch.Tensor,
         grl_lambda: float,
+        pairwise_t_matrix: Optional[torch.Tensor] = None,
+        adapter_domain: Optional[str] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         return fused_features, {}
 
@@ -389,26 +391,249 @@ class DUSAAdapter(FusionAgnosticDomainAdapter):
 
 
 class IADAAdapter(FusionAgnosticDomainAdapter):
-    """Interaction-graph alignment without fusion-specific score injection."""
+    """Interventional advantage adaptation for collaborative perception.
+
+    IADA treats the ego-only feature as a counterfactual control and learns a
+    bounded, identity-initialized modulation of the innovation introduced by
+    collaboration.  The adapter deliberately avoids a domain discriminator:
+    source supervision and target consistency are applied to the *change* in
+    predictions between ego-only and collaborative inference.
+    """
 
     method = "iada"
 
     def __init__(
         self,
         in_channels: int,
-        graph_dim: int = 256,
-        discriminator_hidden_dim: int = 128,
+        anchor_number: int,
+        hidden_dim: int = 64,
+        effect_dim: int = 64,
         geometry_scale: float = 100.0,
-        normalize_domain_embedding: bool = True,
+        gate_limit: float = 1.0,
+        source_supervision_enabled: bool = True,
+        target_consistency_enabled: bool = True,
+        effect_memory_enabled: bool = True,
+        consistency_dropout: float = 0.1,
+        teacher_momentum: float = 0.999,
+        prototype_momentum: float = 0.99,
     ) -> None:
         super().__init__()
-        self.interaction_adapter = InteractionDomainAdapter(
-            in_channels=in_channels,
-            hidden_dim=graph_dim,
-            discriminator_hidden_dim=discriminator_hidden_dim,
-            geometry_scale=geometry_scale,
-            normalize_domain_embedding=normalize_domain_embedding,
+        if in_channels <= 0 or anchor_number <= 0:
+            raise ValueError("IADA channel and anchor counts must be positive")
+        if hidden_dim <= 0 or effect_dim <= 0 or geometry_scale <= 0:
+            raise ValueError("IADA hidden/effect dimensions and scale are invalid")
+        if gate_limit < 0 or not 0 <= consistency_dropout < 1:
+            raise ValueError("IADA gate limit/dropout is invalid")
+        if not 0 <= teacher_momentum < 1 or not 0 <= prototype_momentum < 1:
+            raise ValueError("IADA EMA momenta must be in [0, 1)")
+
+        self.in_channels = int(in_channels)
+        self.anchor_number = int(anchor_number)
+        self.geometry_scale = float(geometry_scale)
+        self.gate_limit = float(gate_limit)
+        self.source_supervision_enabled = bool(source_supervision_enabled)
+        self.target_consistency_enabled = bool(target_consistency_enabled)
+        self.effect_memory_enabled = bool(effect_memory_enabled)
+        self.consistency_dropout = float(consistency_dropout)
+        self.teacher_momentum = float(teacher_momentum)
+        self.prototype_momentum = float(prototype_momentum)
+
+        group_count = min(8, hidden_dim)
+        while hidden_dim % group_count:
+            group_count -= 1
+        self.innovation_encoder = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(group_count, hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.SiLU(inplace=True),
         )
+        self.geometry_encoder = nn.Sequential(
+            nn.Linear(5, hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.gate_head = nn.Conv2d(hidden_dim, in_channels, kernel_size=1)
+        # Zero initialization makes calibrated == native fused at step zero.
+        nn.init.zeros_(self.gate_head.weight)
+        nn.init.zeros_(self.gate_head.bias)
+        self.effect_head = nn.Sequential(
+            nn.Conv2d(hidden_dim, effect_dim, kernel_size=1),
+            nn.SiLU(inplace=True),
+        )
+        self.utility_head = nn.Conv2d(
+            effect_dim, anchor_number, kernel_size=1
+        )
+
+        self.teacher_innovation_encoder = copy.deepcopy(
+            self.innovation_encoder
+        )
+        self.teacher_geometry_encoder = copy.deepcopy(self.geometry_encoder)
+        self.teacher_gate_head = copy.deepcopy(self.gate_head)
+        for module in (
+            self.teacher_innovation_encoder,
+            self.teacher_geometry_encoder,
+            self.teacher_gate_head,
+        ):
+            module.requires_grad_(False)
+
+        # Three effect modes (discovery, suppression, refinement) by three
+        # geometry ranges (near, middle, far).
+        self.register_buffer(
+            "effect_prototypes", torch.zeros(3, 3, effect_dim)
+        )
+        self.register_buffer("effect_counts", torch.zeros(3, 3))
+
+    @staticmethod
+    def _channel_normalize(features: torch.Tensor) -> torch.Tensor:
+        statistics = features.float()
+        mean = statistics.mean(dim=1, keepdim=True)
+        variance = statistics.var(dim=1, keepdim=True, unbiased=False)
+        return ((statistics - mean) * torch.rsqrt(variance + 1.0e-5)).to(
+            features.dtype
+        )
+
+    def _geometry_context(
+        self,
+        record_len: torch.Tensor,
+        pairwise_t_matrix: Optional[torch.Tensor],
+        reference: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_size = int(record_len.numel())
+        context = reference.new_zeros((batch_size, 5))
+        if pairwise_t_matrix is not None and pairwise_t_matrix.shape[1] > 1:
+            transforms = pairwise_t_matrix[:, 0, 1].to(reference)
+            has_partner = (record_len > 1).to(reference.dtype)
+            dx = transforms[:, 0, 3] / self.geometry_scale
+            dy = transforms[:, 1, 3] / self.geometry_scale
+            distance = torch.sqrt(dx.square() + dy.square())
+            yaw = torch.atan2(transforms[:, 1, 0], transforms[:, 0, 0])
+            context = torch.stack(
+                (dx, dy, distance, torch.sin(yaw), torch.cos(yaw)), dim=1
+            ) * has_partner.unsqueeze(1)
+        distance_meters = context[:, 2].abs() * self.geometry_scale
+        range_index = torch.bucketize(
+            distance_meters,
+            reference.new_tensor((30.0, 60.0)),
+        )
+        return context, range_index
+
+    @staticmethod
+    @torch.no_grad()
+    def _ema_update(teacher: nn.Module, student: nn.Module, momentum: float):
+        for teacher_parameter, student_parameter in zip(
+            teacher.parameters(), student.parameters()
+        ):
+            teacher_parameter.mul_(momentum).add_(
+                student_parameter, alpha=1.0 - momentum
+            )
+        for teacher_buffer, student_buffer in zip(
+            teacher.buffers(), student.buffers()
+        ):
+            teacher_buffer.copy_(student_buffer)
+
+    @torch.no_grad()
+    def update_teacher(self) -> None:
+        self._ema_update(
+            self.teacher_innovation_encoder,
+            self.innovation_encoder,
+            self.teacher_momentum,
+        )
+        self._ema_update(
+            self.teacher_geometry_encoder,
+            self.geometry_encoder,
+            self.teacher_momentum,
+        )
+        self._ema_update(
+            self.teacher_gate_head,
+            self.gate_head,
+            self.teacher_momentum,
+        )
+
+    def _encode_innovation(
+        self,
+        innovation: torch.Tensor,
+        geometry: torch.Tensor,
+        *,
+        teacher: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if teacher:
+            hidden = self.teacher_innovation_encoder(innovation)
+            geometry_hidden = self.teacher_geometry_encoder(geometry)
+            gate_logits = self.teacher_gate_head(
+                hidden + geometry_hidden[:, :, None, None]
+            )
+        else:
+            hidden = self.innovation_encoder(innovation)
+            geometry_hidden = self.geometry_encoder(geometry)
+            hidden = hidden + geometry_hidden[:, :, None, None]
+            gate_logits = self.gate_head(hidden)
+        gate = 1.0 + self.gate_limit * torch.tanh(gate_logits)
+        return hidden, gate
+
+    def adapt_fused(
+        self,
+        agent_features: torch.Tensor,
+        fused_features: torch.Tensor,
+        record_len: torch.Tensor,
+        grl_lambda: float,
+        pairwise_t_matrix: Optional[torch.Tensor] = None,
+        adapter_domain: Optional[str] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        del grl_lambda
+        ego_features = extract_ego_features(agent_features, record_len)
+        if ego_features.shape != fused_features.shape:
+            raise ValueError("IADA ego and fused feature shapes must match")
+        raw_innovation = fused_features - ego_features
+        normalized_innovation = self._channel_normalize(
+            fused_features
+        ) - self._channel_normalize(ego_features)
+        geometry, range_index = self._geometry_context(
+            record_len, pairwise_t_matrix, fused_features
+        )
+        hidden, gate = self._encode_innovation(
+            normalized_innovation, geometry
+        )
+        calibrated = ego_features + gate * raw_innovation
+        effect = F.normalize(
+            self.effect_head(hidden), p=2, dim=1, eps=1.0e-6
+        )
+        context = {
+            "iada_ego_features": ego_features,
+            "iada_raw_innovation": raw_innovation,
+            "iada_effect_features": effect,
+            "iada_utility_logits": self.utility_head(effect),
+            "iada_gate_mean": gate.mean().reshape(1),
+            "iada_gate_deviation": (gate - 1.0).abs().mean().reshape(1),
+            "iada_range_index": range_index,
+        }
+
+        if (
+            self.training
+            and adapter_domain == "target"
+            and self.target_consistency_enabled
+        ):
+            self.update_teacher()
+            dropped_innovation = F.dropout2d(
+                raw_innovation,
+                p=self.consistency_dropout,
+                training=self.consistency_dropout > 0,
+            )
+            context["iada_consistency_features"] = (
+                ego_features + gate * dropped_innovation
+            )
+            with torch.no_grad():
+                _, teacher_gate = self._encode_innovation(
+                    normalized_innovation.detach(),
+                    geometry.detach(),
+                    teacher=True,
+                )
+                context["iada_teacher_features"] = (
+                    ego_features.detach()
+                    + teacher_gate * raw_innovation.detach()
+                )
+
+        return calibrated, context
 
     def forward(
         self,
@@ -423,22 +648,40 @@ class IADAAdapter(FusionAgnosticDomainAdapter):
         detection_features: Optional[torch.Tensor] = None,
         adapter_domain: Optional[str] = None,
     ) -> Dict[str, torch.Tensor]:
-        graph_output = self.interaction_adapter(
+        del (
             agent_features,
+            fused_features,
             record_len,
             pairwise_t_matrix,
-            grl_lambda=grl_lambda,
+            grl_lambda,
+            agent_confidence_logits,
+            fused_class_logits,
+            detection_features,
+            adapter_domain,
         )
-        batch_size = graph_output["domain_logits"].shape[0]
-        return {
-            "domain_logits": graph_output["domain_logits"],
-            "domain_scene_index": torch.arange(
-                batch_size, device=agent_features.device
-            ),
-            "domain_valid_mask": graph_output["valid_graph_mask"],
-            "graph_embedding": graph_output["graph_embedding"],
-            "valid_graph_mask": graph_output["valid_graph_mask"],
-        }
+        if context is None or "iada_effect_features" not in context:
+            raise ValueError("IADA adapt_fused must run before its heads")
+        output_keys = (
+            "iada_effect_features",
+            "iada_utility_logits",
+            "iada_gate_mean",
+            "iada_gate_deviation",
+            "iada_range_index",
+            "iada_ego_cls_preds",
+            "iada_ego_reg_preds",
+            "iada_consistency_cls_preds",
+            "iada_consistency_reg_preds",
+            "iada_teacher_cls_preds",
+            "iada_teacher_reg_preds",
+        )
+        output = {key: context[key] for key in output_keys if key in context}
+        if self.effect_memory_enabled:
+            output["iada_effect_prototypes"] = self.effect_prototypes
+            output["iada_effect_counts"] = self.effect_counts
+            output["iada_prototype_momentum"] = self.effect_counts.new_tensor(
+                self.prototype_momentum
+            )
+        return output
 
 
 class HaarWaveletReconstruction(nn.Module):
@@ -665,12 +908,13 @@ class FrequencyShiftAdjustment(nn.Module):
         frequency_weights = 1.0 + torch.tanh(shared_maps)
         refined = frequency_weights * features
 
-        donor_features = refined
-        apply_sao = (
-            self.training
-            and self.sao_enabled
-            and self.sao_probability > 0
+        # SAO randomly exchanges agent statistics during training.  The paper
+        # does not specify stochastic obfuscation at inference, so evaluation
+        # keeps the deterministic refined feature while still applying SFW.
+        apply_sao = self.training and self.sao_enabled and (
+            self.sao_probability > 0
         )
+        obfuscated = refined
         if apply_sao:
             should_swap = self.sao_probability >= 1.0 or bool(
                 torch.rand((), device=features.device).item()
@@ -679,19 +923,20 @@ class FrequencyShiftAdjustment(nn.Module):
             if should_swap:
                 donor_features = refined[
                     self._donor_indices(record_len, refined.device)
-                ]
-
-        # Accumulate statistics in float32 under AMP; cast the normalized map
-        # back before the learned affine weighting.
-        statistical_features = donor_features.float()
-        donor_mean = statistical_features.mean(dim=(-2, -1), keepdim=True)
-        donor_variance = statistical_features.var(
-            dim=(-2, -1), keepdim=True, unbiased=False
-        )
-        obfuscated = (
-            (refined.float() - donor_mean)
-            * torch.rsqrt(donor_variance + self.epsilon)
-        ).to(refined.dtype)
+                ].float()
+                donor_mean = donor_features.mean(
+                    dim=(-2, -1), keepdim=True
+                )
+                donor_variance = donor_features.var(
+                    dim=(-2, -1), keepdim=True, unbiased=False
+                )
+                # Selective Shift, equation (6): normalize the current
+                # feature with the randomly selected agent's mean and
+                # variance.  Statistics are accumulated in float32 under AMP.
+                obfuscated = (
+                    (refined.float() - donor_mean)
+                    / (donor_variance + self.epsilon)
+                ).to(refined.dtype)
         statistical_weights = 1.0 + torch.tanh(
             self.statistical_affine(obfuscated)
         )
@@ -744,18 +989,21 @@ class StagedAdaptiveAlignment(nn.Module):
             raise ValueError("SAA class logits and agent features differ")
         if agent_class_logits.shape[-2:] != agent_features.shape[-2:]:
             raise ValueError("SAA class logits and features must share H/W")
-
-        class_probabilities = agent_class_logits.sigmoid()
-        entropy = self._entropy(class_probabilities)
-        entropy_scale = agent_features.new_tensor(2.0).log()
-        ego_entropy = extract_ego_features(entropy, record_len)
-        global_attention = ego_entropy.amin(dim=1, keepdim=True) / entropy_scale
+        agent_class_probabilities = agent_class_logits.sigmoid()
+        agent_entropy = self._entropy(agent_class_probabilities)
+        ego_class_probabilities = extract_ego_features(
+            agent_class_probabilities, record_len
+        )
+        ego_entropy = self._entropy(ego_class_probabilities)
+        global_attention = ego_entropy.amin(dim=1, keepdim=True)
 
         local_entropy = (
-            entropy.amin(dim=1, keepdim=True)
-            + entropy.amax(dim=1, keepdim=True)
-        ) / (2.0 * entropy_scale)
-        volume_attention = class_probabilities.amin(dim=1, keepdim=True)
+            agent_entropy.amin(dim=1, keepdim=True)
+            + agent_entropy.amax(dim=1, keepdim=True)
+        ) / 2.0
+        volume_attention = agent_class_probabilities.amin(
+            dim=1, keepdim=True
+        )
         mixture = torch.sigmoid(
             self.local_attention_fusion(
                 torch.cat((local_entropy, volume_attention), dim=1)
@@ -1030,7 +1278,10 @@ class CUDAXAdapter(FusionAgnosticDomainAdapter):
         fused_features: torch.Tensor,
         record_len: torch.Tensor,
         grl_lambda: float,
+        pairwise_t_matrix: Optional[torch.Tensor] = None,
+        adapter_domain: Optional[str] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        del pairwise_t_matrix, adapter_domain
         ego_features = extract_ego_features(agent_features, record_len)
         reconstructed = self.ckt(ego_features, fused_features)
         return fused_features, {
@@ -1150,12 +1401,29 @@ def build_domain_adapter(
         )
     if method == "iada":
         return IADAAdapter(
-            in_channels,
-            graph_dim=int(config.get("graph_dim", 256)),
-            discriminator_hidden_dim=hidden_dim,
+            in_channels=in_channels,
+            anchor_number=anchor_number,
+            hidden_dim=int(config.get("iada_hidden_dim", 64)),
+            effect_dim=int(config.get("iada_effect_dim", 64)),
             geometry_scale=float(config.get("geometry_scale", 100.0)),
-            normalize_domain_embedding=bool(
-                config.get("normalize_domain_embedding", True)
+            gate_limit=float(config.get("iada_gate_limit", 1.0)),
+            source_supervision_enabled=bool(
+                config.get("iada_source_supervision_enabled", True)
+            ),
+            target_consistency_enabled=bool(
+                config.get("iada_target_consistency_enabled", True)
+            ),
+            effect_memory_enabled=bool(
+                config.get("iada_effect_memory_enabled", True)
+            ),
+            consistency_dropout=float(
+                config.get("iada_consistency_dropout", 0.1)
+            ),
+            teacher_momentum=float(
+                config.get("iada_teacher_momentum", 0.999)
+            ),
+            prototype_momentum=float(
+                config.get("iada_prototype_momentum", 0.99)
             ),
         )
     if method == "ssda":

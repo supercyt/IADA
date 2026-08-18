@@ -2,8 +2,35 @@
 
 Research code under active development.
 
-Documentation and reproducible experiment instructions will be added when the
-project is ready for release.
+## Interventional Advantage Domain Adaptation
+
+The current IADA implementation adapts the prediction change caused by
+collaboration relative to an ego-only counterfactual. It uses an
+identity-initialized utility gate, source-only safe/correction supervision,
+target intervention consistency with an EMA gate teacher, and a source-only
+context-matched effect memory. It does not use the former graph discriminator.
+
+Four incremental AttFuse configurations can be executed directly. They all
+inherit the common experiment protocol from `pointpillar_attfuse_iada.yaml`
+and warm-start from the baseline directory recorded in each small config:
+
+```bash
+for CONFIG in \
+  pointpillar_attfuse_iada_gate.yaml \
+  pointpillar_attfuse_iada_source.yaml \
+  pointpillar_attfuse_iada_consistency.yaml \
+  pointpillar_attfuse_iada_full.yaml
+do
+  python opencood/tools/train_iada.py \
+    -y "opencood/hypes_yaml/domain_adaptation/opv2v_to_dair/${CONFIG}"
+done
+```
+
+These are independent cumulative ablations from the same source baseline, not
+checkpoint chaining between ablations. If the baseline is retrained, update
+only `domain_adaptation.pretrained_model_dir` in
+`pointpillar_attfuse_iada_common.yaml`.
+See [the full experiment guide](docs/md_files/iada_sim2real.md) for details.
 
 ## Selective Shift (SSDA)
 

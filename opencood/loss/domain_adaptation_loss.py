@@ -162,26 +162,30 @@ def entropy_weighted_domain_loss(
         if not selected_count:
             continue
         selected_weights = weights[selected]
-        denominator = selected_weights.sum()
-        if float(denominator.detach().item()) <= 0:
-            continue
         losses.append(
-            (per_element[selected] * selected_weights).sum() / denominator
+            (per_element[selected] * selected_weights).mean()
         )
-        accuracies.append(
-            (
-                (predictions[selected] == element_labels[selected]).to(
-                    selected_weights.dtype
-                )
-                * selected_weights
-            ).sum()
-            / denominator
-        )
+        accuracy_denominator = selected_weights.sum()
+        if float(accuracy_denominator.detach().item()) > 0:
+            accuracies.append(
+                (
+                    (predictions[selected] == element_labels[selected]).to(
+                        selected_weights.dtype
+                    )
+                    * selected_weights
+                ).sum()
+                / accuracy_denominator
+            )
 
     if len(losses) != 2:
         zero = domain_logits.sum() * 0.0
         return zero, domain_logits.new_tensor(float("nan")), valid_count
-    return torch.stack(losses).mean(), torch.stack(accuracies).mean(), valid_count
+    accuracy = (
+        torch.stack(accuracies).mean()
+        if accuracies
+        else domain_logits.new_tensor(float("nan"))
+    )
+    return torch.stack(losses).mean(), accuracy, valid_count
 
 
 def graph_variance_floor_loss(
@@ -307,20 +311,19 @@ def single_domain_entropy_weighted_loss(
     if bool((weights < 0).any().item()):
         raise ValueError("SSDA attention weights must be non-negative")
 
-    denominator = weights.sum()
     valid_count = int(domain_logits.numel())
-    if float(denominator.detach().item()) <= 0:
-        zero = domain_logits.sum() * 0.0
-        return zero, domain_logits.new_tensor(float("nan")), valid_count
-
     per_element = F.binary_cross_entropy_with_logits(
         domain_logits, labels, reduction="none"
     )
-    loss = (per_element * weights).sum() / denominator
+    loss = (per_element * weights).mean()
     predictions = (domain_logits >= 0).to(labels.dtype)
-    accuracy = (
-        (predictions == labels).to(weights.dtype) * weights
-    ).sum() / denominator
+    accuracy_denominator = weights.sum()
+    if float(accuracy_denominator.detach().item()) > 0:
+        accuracy = (
+            (predictions == labels).to(weights.dtype) * weights
+        ).sum() / accuracy_denominator
+    else:
+        accuracy = domain_logits.new_tensor(float("nan"))
     return loss, accuracy, valid_count
 
 
@@ -490,6 +493,329 @@ def cudax_bin_loss(
     return per_coordinate.mean()
 
 
+def _iada_anchor_last(
+    tensor: torch.Tensor,
+    anchor_number: int,
+    values_per_anchor: int = 1,
+) -> torch.Tensor:
+    """Convert PointPillar channel-first predictions to [B,H,W,A,V]."""
+
+    if tensor.ndim != 4 or tensor.shape[1] != (
+        anchor_number * values_per_anchor
+    ):
+        raise ValueError("IADA prediction channels do not match anchors")
+    batch_size, _, height, width = tensor.shape
+    return tensor.reshape(
+        batch_size,
+        anchor_number,
+        values_per_anchor,
+        height,
+        width,
+    ).permute(0, 3, 4, 1, 2)
+
+
+def _iada_source_effect_memory_update(
+    output_dict: Mapping[str, torch.Tensor],
+    source_targets: Mapping[str, torch.Tensor],
+    ego_cls: torch.Tensor,
+    fused_cls: torch.Tensor,
+    ego_reg_error: torch.Tensor,
+    config: Mapping[str, object],
+) -> int:
+    """Update source-only discovery/suppression/refinement prototypes."""
+
+    required = {
+        "iada_effect_features",
+        "iada_effect_prototypes",
+        "iada_effect_counts",
+        "iada_range_index",
+    }
+    if not required.issubset(output_dict):
+        return 0
+    prototypes = output_dict["iada_effect_prototypes"]
+    counts = output_dict["iada_effect_counts"]
+    features = output_dict["iada_effect_features"].permute(0, 2, 3, 1)
+    positive = source_targets["pos_equal_one"].to(dtype=torch.bool)
+    negative = source_targets.get("neg_equal_one")
+    negative = (
+        negative.to(dtype=torch.bool)
+        if negative is not None
+        else ~positive
+    )
+    ego_probability = ego_cls.sigmoid()
+    fused_probability = fused_cls.sigmoid()
+    ego_max = ego_probability.amax(dim=-1)
+    fused_max = fused_probability.amax(dim=-1)
+    positive_spatial = positive.any(dim=-1)
+    negative_spatial = negative.any(dim=-1)
+    positive_count = positive.sum(dim=-1).clamp_min(1)
+    refinement_error = (
+        ego_reg_error * positive.to(ego_reg_error.dtype)
+    ).sum(dim=-1) / positive_count
+    discovery_threshold = float(
+        config.get("iada_discovery_ego_threshold", 0.5)
+    )
+    refinement_threshold = float(
+        config.get("iada_refinement_error_threshold", 0.1)
+    )
+    masks = (
+        positive_spatial & (ego_max < discovery_threshold),
+        negative_spatial
+        & (ego_max > discovery_threshold)
+        & (fused_max < ego_max),
+        positive_spatial & (refinement_error > refinement_threshold),
+    )
+    range_index = output_dict["iada_range_index"].long()
+    momentum = float(
+        output_dict.get(
+            "iada_prototype_momentum",
+            features.new_tensor(config.get("iada_prototype_momentum", 0.99)),
+        ).item()
+    )
+    update_count = 0
+    with torch.no_grad():
+        for batch_index in range(features.shape[0]):
+            range_value = int(range_index[batch_index].item())
+            for mode_index, mask in enumerate(masks):
+                selected = features[batch_index][mask[batch_index]]
+                if selected.numel() == 0:
+                    continue
+                batch_prototype = F.normalize(
+                    selected.mean(dim=0), dim=0, eps=1.0e-6
+                )
+                if counts[range_value, mode_index] == 0:
+                    prototypes[range_value, mode_index].copy_(batch_prototype)
+                else:
+                    prototypes[range_value, mode_index].mul_(momentum).add_(
+                        batch_prototype, alpha=1.0 - momentum
+                    )
+                    prototypes[range_value, mode_index].copy_(
+                        F.normalize(
+                            prototypes[range_value, mode_index],
+                            dim=0,
+                            eps=1.0e-6,
+                        )
+                    )
+                counts[range_value, mode_index].add_(selected.shape[0])
+                update_count += int(selected.shape[0])
+    return update_count
+
+
+def iada_source_adaptation_loss(
+    output_dict: Mapping[str, torch.Tensor],
+    source_targets: Mapping[str, torch.Tensor],
+    config: Mapping[str, object],
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Source supervision for safe, useful collaborative corrections."""
+
+    fused_cls_raw = output_dict["cls_preds"]
+    fused_reg_raw = output_dict["reg_preds"]
+    ego_cls_raw = output_dict["iada_ego_cls_preds"]
+    ego_reg_raw = output_dict["iada_ego_reg_preds"]
+    anchor_number = int(source_targets["pos_equal_one"].shape[-1])
+    fused_cls = _iada_anchor_last(fused_cls_raw, anchor_number).squeeze(-1)
+    ego_cls = _iada_anchor_last(ego_cls_raw, anchor_number).squeeze(-1)
+    fused_reg = _iada_anchor_last(fused_reg_raw, anchor_number, 7)
+    ego_reg = _iada_anchor_last(ego_reg_raw, anchor_number, 7)
+    targets = source_targets["targets"].reshape_as(fused_reg)
+    positive = source_targets["pos_equal_one"].to(dtype=torch.bool)
+    negative = source_targets.get("neg_equal_one")
+    valid = positive | (
+        negative.to(dtype=torch.bool)
+        if negative is not None
+        else ~positive
+    )
+    class_targets = positive.to(fused_cls.dtype)
+
+    fused_cls_error = F.binary_cross_entropy_with_logits(
+        fused_cls, class_targets, reduction="none"
+    )
+    ego_cls_error = F.binary_cross_entropy_with_logits(
+        ego_cls, class_targets, reduction="none"
+    ).detach()
+    fused_reg_error = F.smooth_l1_loss(
+        fused_reg, targets, reduction="none"
+    ).mean(dim=-1)
+    ego_reg_error = F.smooth_l1_loss(
+        ego_reg, targets, reduction="none"
+    ).mean(dim=-1).detach()
+    margin = float(config.get("iada_safe_margin", 0.0))
+    safe_cls = F.relu(fused_cls_error - ego_cls_error + margin)[valid].mean()
+    if bool(positive.any().item()):
+        safe_reg = F.relu(
+            fused_reg_error - ego_reg_error + margin
+        )[positive].mean()
+        correction_target = (targets - ego_reg.detach())[positive]
+        correction_loss = F.smooth_l1_loss(
+            (fused_reg - ego_reg)[positive], correction_target
+        )
+    else:
+        safe_reg = fused_reg_raw.sum() * 0.0
+        correction_loss = fused_reg_raw.sum() * 0.0
+    safe_loss = safe_cls + safe_reg
+
+    utility_target = (ego_cls_error - fused_cls_error).detach()
+    utility_target = utility_target + positive.to(utility_target.dtype) * (
+        ego_reg_error - fused_reg_error
+    ).detach()
+    utility_target = utility_target.tanh()
+    utility_logits = output_dict["iada_utility_logits"]
+    utility_prediction = _iada_anchor_last(
+        utility_logits, anchor_number
+    ).squeeze(-1).tanh()
+    utility_loss = F.smooth_l1_loss(
+        utility_prediction[valid], utility_target[valid]
+    )
+
+    memory_updates = _iada_source_effect_memory_update(
+        output_dict,
+        source_targets,
+        ego_cls,
+        fused_cls,
+        ego_reg_error,
+        config,
+    )
+    total = (
+        float(config.get("iada_safe_weight", 0.0)) * safe_loss
+        + float(config.get("iada_correction_weight", 0.0))
+        * correction_loss
+        + float(config.get("iada_utility_weight", 0.0)) * utility_loss
+    )
+    metrics = {
+        "iada_safe_loss": safe_loss,
+        "iada_correction_loss": correction_loss,
+        "iada_utility_loss": utility_loss,
+        "iada_effect_memory_updates": total.new_tensor(memory_updates),
+        "iada_gate_mean": output_dict["iada_gate_mean"].mean(),
+        "iada_gate_deviation": output_dict[
+            "iada_gate_deviation"
+        ].mean(),
+        "domain_loss": total,
+        "domain_accuracy": total.new_tensor(float("nan")),
+    }
+    return total, metrics
+
+
+def iada_target_adaptation_loss(
+    output_dict: Mapping[str, torch.Tensor],
+    config: Mapping[str, object],
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Target intervention consistency and conditional effect alignment."""
+
+    zero = output_dict["cls_preds"].sum() * 0.0
+    consistency_loss = zero
+    effect_loss = zero
+    selected_count = 0
+    teacher_keys = {
+        "iada_consistency_cls_preds",
+        "iada_consistency_reg_preds",
+        "iada_teacher_cls_preds",
+        "iada_teacher_reg_preds",
+        "iada_ego_cls_preds",
+        "iada_ego_reg_preds",
+    }
+    if teacher_keys.issubset(output_dict):
+        student_cls = output_dict["iada_consistency_cls_preds"]
+        student_reg = output_dict["iada_consistency_reg_preds"]
+        teacher_cls = output_dict["iada_teacher_cls_preds"].detach()
+        teacher_reg = output_dict["iada_teacher_reg_preds"].detach()
+        ego_cls = output_dict["iada_ego_cls_preds"]
+        ego_reg = output_dict["iada_ego_reg_preds"]
+        teacher_probability = teacher_cls.sigmoid()
+        ego_probability = ego_cls.detach().sigmoid()
+        confidence_threshold = float(
+            config.get("iada_target_confidence_threshold", 0.6)
+        )
+        advantage_threshold = float(
+            config.get("iada_target_advantage_threshold", 0.03)
+        )
+        teacher_advantage = teacher_probability - ego_probability
+        teacher_reg_advantage = teacher_reg - ego_reg.detach()
+        reliable = (teacher_probability >= confidence_threshold) & (
+            (teacher_advantage.abs() >= advantage_threshold)
+            | (
+                teacher_reg_advantage.reshape(
+                    teacher_reg_advantage.shape[0], -1, 7,
+                    *teacher_reg_advantage.shape[-2:]
+                ).abs().mean(dim=2).amax(dim=1, keepdim=True)
+                >= advantage_threshold
+            )
+        )
+        selected_count = int(reliable.sum().item())
+        if selected_count:
+            student_advantage = student_cls.sigmoid() - ego_cls.sigmoid()
+            consistency_cls = F.smooth_l1_loss(
+                student_advantage[reliable], teacher_advantage[reliable]
+            )
+            anchor_mask = reliable.repeat_interleave(7, dim=1)
+            consistency_reg = F.smooth_l1_loss(
+                (student_reg - ego_reg)[anchor_mask],
+                teacher_reg_advantage[anchor_mask],
+            )
+            consistency_loss = consistency_cls + consistency_reg
+
+        memory_keys = {
+            "iada_effect_features",
+            "iada_effect_prototypes",
+            "iada_effect_counts",
+            "iada_range_index",
+        }
+        if memory_keys.issubset(output_dict):
+            spatial_confidence = teacher_probability.amax(dim=1)
+            spatial_ego = ego_probability.amax(dim=1)
+            spatial_reliable = reliable.any(dim=1)
+            discovery = spatial_reliable & (
+                spatial_confidence - spatial_ego >= advantage_threshold
+            )
+            suppression = spatial_reliable & (
+                spatial_ego - spatial_confidence >= advantage_threshold
+            )
+            refinement = spatial_reliable & ~(discovery | suppression)
+            effect = output_dict["iada_effect_features"].permute(0, 2, 3, 1)
+            prototypes = output_dict["iada_effect_prototypes"].detach()
+            counts = output_dict["iada_effect_counts"]
+            ranges = output_dict["iada_range_index"].long()
+            effect_terms = []
+            for batch_index in range(effect.shape[0]):
+                range_value = int(ranges[batch_index].item())
+                for mode_index, mask in enumerate(
+                    (discovery, suppression, refinement)
+                ):
+                    if counts[range_value, mode_index] <= 0:
+                        continue
+                    selected = effect[batch_index][mask[batch_index]]
+                    if selected.numel() == 0:
+                        continue
+                    prototype = F.normalize(
+                        prototypes[range_value, mode_index],
+                        dim=0,
+                        eps=1.0e-6,
+                    )
+                    effect_terms.append(
+                        1.0 - (selected * prototype).sum(dim=-1).mean()
+                    )
+            if effect_terms:
+                effect_loss = torch.stack(effect_terms).mean()
+
+    total = (
+        float(config.get("iada_consistency_weight", 0.0))
+        * consistency_loss
+        + float(config.get("iada_effect_weight", 0.0)) * effect_loss
+    )
+    metrics = {
+        "iada_consistency_loss": consistency_loss,
+        "iada_effect_loss": effect_loss,
+        "iada_target_selected": total.new_tensor(selected_count),
+        "iada_gate_mean": output_dict["iada_gate_mean"].mean(),
+        "iada_gate_deviation": output_dict[
+            "iada_gate_deviation"
+        ].mean(),
+        "domain_loss": total,
+        "domain_accuracy": total.new_tensor(float("nan")),
+    }
+    return total, metrics
+
+
 def compute_adaptation_loss(
     method: str,
     output_dict: Mapping[str, torch.Tensor],
@@ -598,32 +924,21 @@ def compute_adaptation_loss(
         )
 
     if method == "iada":
-        domain_loss, domain_accuracy, valid_count = balanced_domain_loss(
-            output_dict["domain_logits"],
-            domain_labels,
-            output_dict.get("domain_scene_index"),
-            output_dict.get("domain_valid_mask"),
-        )
-        variance_loss, variance_applied = graph_variance_floor_loss(
-            output_dict["graph_embedding"],
-            output_dict["valid_graph_mask"],
-            source_scene_count,
-            float(config.get("graph_variance_target_std", 0.0)),
-        )
-        metrics.update(
-            domain_loss=domain_loss,
-            domain_accuracy=domain_accuracy,
-            valid_domain_count=domain_loss.new_tensor(valid_count),
-            graph_variance_loss=variance_loss,
-            graph_variance_update_applied=domain_loss.new_tensor(
-                variance_applied
-            ),
-        )
-        return (
-            float(config.get("domain_loss_weight", 0.1)) * domain_loss
-            + float(config.get("graph_variance_weight", 0.0))
-            * variance_loss,
-            metrics,
+        total_scenes = int(domain_labels.numel())
+        source_output = {}
+        for key, value in output_dict.items():
+            if (
+                torch.is_tensor(value)
+                and value.ndim > 0
+                and value.shape[0] == total_scenes
+                and key
+                not in ("iada_effect_prototypes", "iada_effect_counts")
+            ):
+                source_output[key] = value[:source_scene_count]
+            else:
+                source_output[key] = value
+        return iada_source_adaptation_loss(
+            source_output, source_label_dict, config
         )
 
     if method == "ssda":
@@ -796,38 +1111,14 @@ def compute_single_domain_adaptation_loss(
         )
 
     if method == "iada":
-        domain_loss, domain_accuracy, valid_count = single_domain_loss(
-            output_dict["domain_logits"],
-            domain_label,
-            output_dict.get("domain_scene_index"),
-            output_dict.get("domain_valid_mask"),
-        )
-        if not iada_domain_enabled:
-            domain_loss = output_dict["domain_logits"].sum() * 0.0
-            domain_accuracy = domain_loss.new_tensor(float("nan"))
-        domain_contribution = 0.5 * domain_loss
-        variance_loss = single_domain_graph_variance_loss(
-            output_dict["graph_embedding"],
-            output_dict["valid_graph_mask"],
-            float(config.get("graph_variance_target_std", 0.0)),
-            iada_variance_enabled,
-        )
-        metrics.update(
-            domain_loss=domain_contribution,
-            domain_accuracy=domain_accuracy,
-            valid_domain_count=domain_loss.new_tensor(valid_count),
-            graph_variance_loss=variance_loss,
-            graph_variance_update_applied=domain_loss.new_tensor(
-                int(iada_variance_enabled)
-            ),
-        )
-        return (
-            float(config.get("domain_loss_weight", 0.1))
-            * domain_contribution
-            + float(config.get("graph_variance_weight", 0.0))
-            * variance_loss,
-            metrics,
-        )
+        del iada_domain_enabled, iada_variance_enabled
+        if domain == "source":
+            if source_label_dict is None:
+                raise ValueError("IADA source loss requires source labels")
+            return iada_source_adaptation_loss(
+                output_dict, source_label_dict, config
+            )
+        return iada_target_adaptation_loss(output_dict, config)
 
     if method == "ssda":
         global_loss, global_accuracy, global_count = (
@@ -879,6 +1170,8 @@ __all__ = [
     "dusa_agent_loss",
     "entropy_weighted_domain_loss",
     "graph_variance_floor_loss",
+    "iada_source_adaptation_loss",
+    "iada_target_adaptation_loss",
     "single_domain_entropy_weighted_loss",
     "single_domain_graph_variance_loss",
     "single_domain_loss",

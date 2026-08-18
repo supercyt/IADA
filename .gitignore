@@ -147,3 +147,5 @@ nohup.out
 ./vscode
 ./.agents
 ./.codex
+training_logs
+papers

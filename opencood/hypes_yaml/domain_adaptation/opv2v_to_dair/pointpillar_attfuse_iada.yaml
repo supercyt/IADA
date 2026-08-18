@@ -12,9 +12,9 @@ yaml_parser: "load_point_pillar_params"
 
 train_params:
   batch_size: 4
-  epoches: 20
-  eval_freq: 1
-  save_freq: 1
+  epoches: 25
+  eval_freq: 2
+  save_freq: 2
   max_cav: 2
 
 # The first experiment isolates Sim2Real shift from additional synthetic pose
@@ -129,9 +129,19 @@ model:
       dusa_cia_hidden_dim: 512
       lsa_grl_scale: 0.05
       cia_grl_scale: 0.1
-      graph_dim: 256
+      # Interventional Advantage Domain Adaptation (IADA). The collaboration
+      # gate is identity initialized; the following switches support the
+      # incremental ablation configs in this directory.
+      iada_hidden_dim: 64
+      iada_effect_dim: 64
+      iada_gate_limit: 1.0
+      iada_source_supervision_enabled: true
+      iada_target_consistency_enabled: true
+      iada_effect_memory_enabled: true
+      iada_consistency_dropout: 0.1
+      iada_teacher_momentum: 0.999
+      iada_prototype_momentum: 0.99
       geometry_scale: 100.0
-      normalize_domain_embedding: true
       cudax_hidden_dim: 256
       ckt_groups: 8
       # CUDA-X paper leaves the within-slice shuffle grouping unspecified;
@@ -171,7 +181,7 @@ loss:
 
 optimizer:
   core_method: Adam
-  lr: 0.0002
+  lr: 0.001
   args:
     eps: 1.0e-10
     weight_decay: 1.0e-4
@@ -203,6 +213,19 @@ domain_adaptation:
   dusa_cia_weight: 1.0
   cudax_bin_loss_weight: 0.1
   cudax_domain_loss_weight: 0.1
+  # IADA source utility/correction, target intervention consistency, and
+  # context-matched effect-memory objectives.
+  iada_safe_weight: 0.1
+  iada_correction_weight: 0.2
+  iada_utility_weight: 0.1
+  iada_consistency_weight: 0.1
+  iada_effect_weight: 0.05
+  iada_safe_margin: 0.0
+  iada_target_confidence_threshold: 0.6
+  iada_target_advantage_threshold: 0.03
+  iada_discovery_ego_threshold: 0.5
+  iada_refinement_error_threshold: 0.1
+  iada_prototype_momentum: 0.99
   # Equation (18) in Selective Shift uses beta_1=0.5 and beta_2=1.0.
   ssda_global_weight: 0.5
   ssda_local_weight: 1.0
@@ -211,19 +234,14 @@ domain_adaptation:
   # order [dx, dy, dz, dlog_h, dlog_w, dlog_l], computed only from positive
   # anchors in the OPV2V source training split. The empty list intentionally
   # fails CUDA-X validation instead of silently using target statistics.
-  cudax_residual_bounds: []
+  cudax_residual_bounds: [0.347788833, 0.359736341, 1.20948187, 0.253829773, 0.1343223, 0.220715908]
   # The detector is already converged at the baseline checkpoint; preserve it
   # with a 10x smaller LR while the fresh adapter branch uses the base LR.
   pretrained_lr_scale: 0.1
   adapter_lr_scale: 1.0
-  # Anti-collapse safeguard for the interaction-only branch. The aggregate
-  # RMS-std floor is computed within each domain, so it preserves informative
-  # graph variation without rewarding source/target separation or forcing
-  # every ReLU channel active. A target std of 0.01 matches the freshly
-  # initialized encoder's observed scale; weight 1.0 contributes at most
-  # about 0.01 loss when collapsed and zero once the floor is reached.
-  graph_variance_weight: 1.0
-  graph_variance_target_std: 0.01
+  # Retained at zero only for backward-compatible parsing of old checkpoints.
+  graph_variance_weight: 0.0
+  graph_variance_target_std: 0.0
   gradient_clip_norm: 10.0
   grl:
     max_value: 1.0

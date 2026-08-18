@@ -14,6 +14,8 @@ from opencood.loss.domain_adaptation_loss import (
     cudax_bin_loss,
     dusa_agent_loss,
     entropy_weighted_domain_loss,
+    iada_source_adaptation_loss,
+    iada_target_adaptation_loss,
 )
 from opencood.tools.compute_cudax_bounds import (
     compute_source_residual_bounds,
@@ -106,8 +108,8 @@ class AdapterFactoryTest(unittest.TestCase):
                 {
                     "enabled": True,
                     "method": "iada",
-                    "graph_dim": 4,
-                    "hidden_dim": 4,
+                    "iada_hidden_dim": 4,
+                    "iada_effect_dim": 4,
                 },
                 IADAAdapter,
             ),
@@ -172,6 +174,55 @@ class AdapterForwardTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(refined).all().item())
         refined.square().mean().backward()
         self.assertGreater(features.grad.abs().sum().item(), 0.0)
+
+    def test_fsa_sao_uses_donor_mean_and_variance(self):
+        features = torch.tensor(
+            [
+                [
+                    [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]],
+                    [[2.0, 4.0, 6.0], [8.0, 10.0, 12.0]],
+                ],
+                [
+                    [[10.0, 13.0, 16.0], [19.0, 22.0, 25.0]],
+                    [[-8.0, -4.0, 0.0], [4.0, 8.0, 12.0]],
+                ],
+            ]
+        )
+        adapter = FrequencyShiftAdjustment(
+            2, sao_enabled=True, sao_probability=1.0
+        ).train()
+
+        refined = adapter(features, torch.tensor([2]))
+
+        source = features.float()
+        donor = source.flip(0)
+        donor_mean = donor.mean(dim=(-2, -1), keepdim=True)
+        donor_variance = donor.var(
+            dim=(-2, -1), keepdim=True, unbiased=False
+        )
+        expected = (source - donor_mean) / (
+            donor_variance + adapter.epsilon
+        )
+        torch.testing.assert_close(refined, expected)
+
+    def test_fsa_eval_preserves_neutral_frequency_refinement(self):
+        features = torch.randn(4, 4, 3, 5)
+        adapter = FrequencyShiftAdjustment(4).eval()
+
+        refined = adapter(features, torch.tensor([2, 1, 1]))
+
+        torch.testing.assert_close(refined, features)
+
+    def test_fsa_eval_applies_statistical_feature_weighting(self):
+        features = torch.randn(2, 3, 3, 5)
+        adapter = FrequencyShiftAdjustment(3).eval()
+        with torch.no_grad():
+            adapter.statistical_affine.bias.fill_(0.25)
+
+        refined = adapter(features, torch.tensor([2]))
+
+        expected_scale = 1.0 + math.tanh(0.25)
+        torch.testing.assert_close(refined, expected_scale * features)
 
     def test_naive_grl_aligns_every_flattened_agent(self):
         agent_features, fused_features, record_len, pairwise = (
@@ -316,31 +367,61 @@ class AdapterForwardTest(unittest.TestCase):
         expected = torch.full_like(weights, 0.5)
         torch.testing.assert_close(weights, expected, atol=1.0e-4, rtol=0)
 
-    def test_iada_returns_only_graph_alignment_outputs(self):
-        agent_features, fused_features, _, _ = _adapter_inputs()
-        record_len = torch.tensor([2, 1, 1])
-        pairwise = _identity_pairwise(record_len)
+    def test_iada_identity_gate_preserves_native_fusion(self):
+        agent_features, fused_features, record_len, pairwise = (
+            _adapter_inputs()
+        )
         adapter = IADAAdapter(
             in_channels=4,
-            graph_dim=6,
-            discriminator_hidden_dim=4,
+            anchor_number=2,
+            hidden_dim=4,
+            effect_dim=6,
         )
 
-        output = adapter(
+        calibrated, context = adapter.adapt_fused(
             agent_features,
-            fused_features.new_empty(3, 4, 2, 2),
+            fused_features,
             record_len,
-            pairwise,
             grl_lambda=0.5,
+            pairwise_t_matrix=pairwise,
         )
 
-        self.assertEqual(output["domain_logits"].shape, (3, 1))
-        self.assertEqual(output["graph_embedding"].shape, (3, 6))
-        torch.testing.assert_close(
-            output["valid_graph_mask"],
-            torch.tensor([True, False, False]),
+        torch.testing.assert_close(calibrated, fused_features)
+        self.assertEqual(context["iada_effect_features"].shape, (2, 6, 2, 2))
+        self.assertEqual(context["iada_utility_logits"].shape, (2, 2, 2, 2))
+        self.assertEqual(context["iada_range_index"].shape, (2,))
+        self.assertEqual(context["iada_gate_mean"].item(), 1.0)
+
+    def test_iada_target_builds_intervention_and_teacher_views(self):
+        agent_features, fused_features, record_len, pairwise = (
+            _adapter_inputs()
         )
-        self.assertNotIn("interaction_logits", output)
+        adapter = IADAAdapter(
+            in_channels=4,
+            anchor_number=2,
+            hidden_dim=4,
+            effect_dim=4,
+            consistency_dropout=0.25,
+        ).train()
+
+        _, context = adapter.adapt_fused(
+            agent_features,
+            fused_features,
+            record_len,
+            grl_lambda=0.0,
+            pairwise_t_matrix=pairwise,
+            adapter_domain="target",
+        )
+
+        self.assertEqual(
+            context["iada_consistency_features"].shape,
+            fused_features.shape,
+        )
+        self.assertEqual(
+            context["iada_teacher_features"].shape,
+            fused_features.shape,
+        )
+        self.assertFalse(context["iada_teacher_features"].requires_grad)
 
     def test_ssda_exposes_entropy_weighted_global_and_local_heads(self):
         agent_features, fused_features, record_len, pairwise = (
@@ -357,6 +438,7 @@ class AdapterForwardTest(unittest.TestCase):
             pairwise,
             grl_lambda=0.5,
             agent_confidence_logits=class_logits,
+            fused_class_logits=torch.randn(2, 2, 2, 2),
         )
 
         self.assertEqual(output["ssda_global_logits"].shape, (2, 1, 2, 2))
@@ -367,6 +449,32 @@ class AdapterForwardTest(unittest.TestCase):
             ((output["ssda_local_attention"] >= 0)
              & (output["ssda_local_attention"] <= 1)).all().item()
         )
+
+    def test_ssda_global_head_uses_ego_agent_features(self):
+        agent_features, fused_features, record_len, pairwise = (
+            _adapter_inputs()
+        )
+        agent_features.requires_grad_()
+        fused_features.requires_grad_()
+        adapter = SSDAAdapter(in_channels=4, hidden_dim=4).eval()
+        with torch.no_grad():
+            for parameter in adapter.saa.global_classifier.parameters():
+                parameter.fill_(0.1)
+
+        output = adapter(
+            agent_features,
+            fused_features,
+            record_len,
+            pairwise,
+            grl_lambda=0.5,
+            agent_confidence_logits=torch.randn(4, 2, 2, 2),
+            fused_class_logits=torch.randn(2, 2, 2, 2),
+        )
+        output["ssda_global_logits"].sum().backward()
+
+        self.assertIsNotNone(agent_features.grad)
+        self.assertGreater(agent_features.grad.abs().sum().item(), 0.0)
+        self.assertIsNone(fused_features.grad)
 
     def test_cudax_heads_observe_fused_outputs_without_replacing_them(self):
         agent_features, fused_features, record_len, pairwise = (
@@ -586,7 +694,7 @@ class AdaptationLossTest(unittest.TestCase):
             scene_indices=torch.tensor([0, 0, 1]),
         )
 
-        self.assertAlmostEqual(loss.item(), math.log(2.0), places=6)
+        self.assertAlmostEqual(loss.item(), 0.5 * math.log(2.0), places=6)
         self.assertAlmostEqual(accuracy.item(), 0.5, places=6)
         self.assertEqual(valid_count, 12)
         loss.backward()
@@ -654,6 +762,85 @@ class AdaptationLossTest(unittest.TestCase):
         loss.backward()
         torch.testing.assert_close(logits.grad, torch.zeros_like(logits))
 
+    def test_iada_source_losses_supervise_harmful_collaboration(self):
+        fused_cls = torch.full((1, 2, 1, 1), -2.0, requires_grad=True)
+        fused_reg = torch.ones(1, 14, 1, 1, requires_grad=True)
+        prototypes = torch.zeros(3, 3, 4)
+        counts = torch.zeros(3, 3)
+        output = {
+            "cls_preds": fused_cls,
+            "reg_preds": fused_reg,
+            "iada_ego_cls_preds": torch.full((1, 2, 1, 1), -0.5),
+            "iada_ego_reg_preds": torch.zeros(1, 14, 1, 1),
+            "iada_utility_logits": torch.zeros(
+                1, 2, 1, 1, requires_grad=True
+            ),
+            "iada_effect_features": torch.ones(1, 4, 1, 1),
+            "iada_gate_mean": torch.ones(1),
+            "iada_gate_deviation": torch.zeros(1),
+            "iada_range_index": torch.zeros(1, dtype=torch.long),
+            "iada_effect_prototypes": prototypes,
+            "iada_effect_counts": counts,
+            "iada_prototype_momentum": torch.tensor(0.9),
+        }
+        targets = {
+            "targets": torch.zeros(1, 1, 1, 14),
+            "pos_equal_one": torch.ones(1, 1, 1, 2),
+            "neg_equal_one": torch.zeros(1, 1, 1, 2),
+        }
+
+        loss, metrics = iada_source_adaptation_loss(
+            output,
+            targets,
+            {
+                "iada_safe_weight": 1.0,
+                "iada_correction_weight": 1.0,
+                "iada_utility_weight": 1.0,
+            },
+        )
+
+        self.assertGreater(loss.item(), 0.0)
+        self.assertGreater(metrics["iada_safe_loss"].item(), 0.0)
+        self.assertGreater(metrics["iada_correction_loss"].item(), 0.0)
+        self.assertGreater(counts.sum().item(), 0.0)
+        loss.backward()
+        self.assertGreater(fused_cls.grad.abs().sum().item(), 0.0)
+        self.assertGreater(fused_reg.grad.abs().sum().item(), 0.0)
+
+    def test_iada_target_consistency_uses_advantage_not_absolute_logits(self):
+        student_cls = torch.full(
+            (1, 2, 1, 1), -1.0, requires_grad=True
+        )
+        student_reg = torch.ones(1, 14, 1, 1, requires_grad=True)
+        output = {
+            "cls_preds": torch.zeros(1, 2, 1, 1, requires_grad=True),
+            "reg_preds": torch.zeros(1, 14, 1, 1),
+            "iada_ego_cls_preds": torch.zeros(1, 2, 1, 1),
+            "iada_ego_reg_preds": torch.zeros(1, 14, 1, 1),
+            "iada_consistency_cls_preds": student_cls,
+            "iada_consistency_reg_preds": student_reg,
+            "iada_teacher_cls_preds": torch.full((1, 2, 1, 1), 2.0),
+            "iada_teacher_reg_preds": torch.zeros(1, 14, 1, 1),
+            "iada_gate_mean": torch.ones(1),
+            "iada_gate_deviation": torch.zeros(1),
+        }
+
+        loss, metrics = iada_target_adaptation_loss(
+            output,
+            {
+                "iada_consistency_weight": 1.0,
+                "iada_effect_weight": 0.0,
+                "iada_target_confidence_threshold": 0.6,
+                "iada_target_advantage_threshold": 0.01,
+            },
+        )
+
+        self.assertGreater(loss.item(), 0.0)
+        self.assertGreater(metrics["iada_target_selected"].item(), 0)
+        loss.backward()
+        self.assertGreater(student_cls.grad.abs().sum().item(), 0.0)
+        self.assertGreater(student_reg.grad.abs().sum().item(), 0.0)
+
     def test_loss_dispatch_matches_supported_methods(self):
         labels = torch.tensor([0.0, 1.0])
         record_len = torch.tensor([2, 2])
@@ -697,29 +884,37 @@ class AdaptationLossTest(unittest.TestCase):
             dusa_loss.item(), 0.75 * math.log(2.0), places=6
         )
 
+        iada_output = {
+            "cls_preds": torch.zeros(1, 2, 1, 1),
+            "reg_preds": torch.zeros(1, 14, 1, 1),
+            "iada_ego_cls_preds": torch.zeros(1, 2, 1, 1),
+            "iada_ego_reg_preds": torch.zeros(1, 14, 1, 1),
+            "iada_utility_logits": torch.zeros(1, 2, 1, 1),
+            "iada_effect_features": torch.ones(1, 3, 1, 1),
+            "iada_gate_mean": torch.ones(1),
+            "iada_gate_deviation": torch.zeros(1),
+            "iada_range_index": torch.zeros(1, dtype=torch.long),
+        }
+        iada_targets = {
+            "targets": torch.zeros(1, 1, 1, 14),
+            "pos_equal_one": torch.ones(1, 1, 1, 2),
+            "neg_equal_one": torch.zeros(1, 1, 1, 2),
+        }
         iada_loss, metrics = compute_adaptation_loss(
             "iada",
-            {
-                "domain_logits": torch.zeros(2, 1),
-                "domain_scene_index": torch.arange(2),
-                "domain_valid_mask": torch.ones(2, dtype=torch.bool),
-                "graph_embedding": torch.zeros(2, 3),
-                "valid_graph_mask": torch.ones(2, dtype=torch.bool),
-            },
-            labels,
+            iada_output,
+            labels[:1],
             source_scene_count=1,
-            record_len=record_len,
-            source_label_dict=empty_targets,
+            record_len=record_len[:1],
+            source_label_dict=iada_targets,
             config={
-                "domain_loss_weight": 0.2,
-                "graph_variance_target_std": 0.0,
-                "graph_variance_weight": 1.0,
+                "iada_safe_weight": 0.2,
+                "iada_correction_weight": 0.2,
+                "iada_utility_weight": 0.2,
             },
         )
-        self.assertAlmostEqual(
-            iada_loss.item(), 0.2 * math.log(2.0), places=6
-        )
-        self.assertEqual(metrics["graph_variance_update_applied"].item(), 0)
+        self.assertEqual(iada_loss.item(), 0.0)
+        self.assertEqual(metrics["iada_safe_loss"].item(), 0.0)
 
         ssda_loss, metrics = compute_adaptation_loss(
             "ssda",
@@ -1140,7 +1335,10 @@ class PointPillarBaselineAdapterTest(unittest.TestCase):
                 "dusa_lsa_hidden_dim": 8,
                 "dusa_cia_hidden_dim": 8,
             },
-            "iada": {"hidden_dim": 8, "graph_dim": 8},
+            "iada": {
+                "iada_hidden_dim": 8,
+                "iada_effect_dim": 8,
+            },
             "cudax": {
                 "hidden_dim": 8,
                 "feature_size": [4, 4],
@@ -1153,7 +1351,11 @@ class PointPillarBaselineAdapterTest(unittest.TestCase):
         expected_adapter_outputs = {
             "grl": {"domain_logits"},
             "dusa": {"domain_logits", "agent_domain_logits"},
-            "iada": {"domain_logits", "graph_embedding"},
+            "iada": {
+                "iada_effect_features",
+                "iada_ego_cls_preds",
+                "iada_ego_reg_preds",
+            },
             "cudax": {
                 "ckt_domain_logits",
                 "blc_domain_logits",

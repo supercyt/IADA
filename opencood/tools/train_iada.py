@@ -410,7 +410,8 @@ def train_parser():
         default=None,
         help=(
             "baseline: source detection only; grl: naive discriminator; "
-            "dusa: LSA+CIA; cudax: CKT+BLC+CPA; iada: graph alignment; "
+            "dusa: LSA+CIA; cudax: CKT+BLC+CPA; iada: interventional "
+            "collaboration-advantage adaptation; "
             "ssda: Selective Shift FSA+SAA"
         ),
     )
@@ -472,6 +473,41 @@ def _configure_stage(hypes, requested_stage):
                 "cudax_residual_bounds in encoded "
                 "[x, y, z, h, w, l] order"
             )
+    if stage == "iada":
+        source_enabled = bool(
+            adapter_cfg.get("iada_source_supervision_enabled", True)
+        )
+        consistency_enabled = bool(
+            adapter_cfg.get("iada_target_consistency_enabled", True)
+        )
+        memory_enabled = bool(
+            adapter_cfg.get("iada_effect_memory_enabled", True)
+        )
+        source_weight = sum(
+            float(da_cfg.get(key, 0.0))
+            for key in (
+                "iada_safe_weight",
+                "iada_correction_weight",
+                "iada_utility_weight",
+            )
+        )
+        if source_weight > 0 and not source_enabled:
+            raise ValueError(
+                "IADA source loss weights require source supervision"
+            )
+        if (
+            float(da_cfg.get("iada_consistency_weight", 0.0)) > 0
+            and not consistency_enabled
+        ):
+            raise ValueError(
+                "IADA consistency weight requires target consistency"
+            )
+        if float(da_cfg.get("iada_effect_weight", 0.0)) > 0 and (
+            not memory_enabled or not consistency_enabled
+        ):
+            raise ValueError(
+                "IADA effect alignment requires memory and consistency"
+            )
 
     nonnegative_weights = (
         "domain_loss_weight",
@@ -481,6 +517,11 @@ def _configure_stage(hypes, requested_stage):
         "dusa_cia_weight",
         "cudax_bin_loss_weight",
         "cudax_domain_loss_weight",
+        "iada_safe_weight",
+        "iada_correction_weight",
+        "iada_utility_weight",
+        "iada_consistency_weight",
+        "iada_effect_weight",
         "ssda_global_weight",
         "ssda_local_weight",
     )

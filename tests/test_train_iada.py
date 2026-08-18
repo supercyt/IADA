@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 import yaml
 
+import opencood.hypes_yaml.yaml_utils as yaml_utils
 from opencood.tools.train_iada import (
     TRAINING_STATE_FILENAME,
     _balanced_domain_loss,
@@ -31,6 +32,31 @@ from opencood.tools.train_iada import (
     _validate_baseline_warm_start,
     _validate_detection,
 )
+
+
+class YAMLInheritanceTest(unittest.TestCase):
+    def test_child_config_deep_merges_relative_base(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base_path = os.path.join(directory, "base.yaml")
+            child_path = os.path.join(directory, "child.yaml")
+            with open(base_path, "w") as stream:
+                yaml.safe_dump(
+                    {"model": {"args": {"a": 1, "b": 2}}, "value": 3},
+                    stream,
+                )
+            with open(child_path, "w") as stream:
+                yaml.safe_dump(
+                    {
+                        "base_config": "base.yaml",
+                        "model": {"args": {"b": 9}},
+                    },
+                    stream,
+                )
+
+            loaded = yaml_utils.load_yaml(child_path)
+
+        self.assertEqual(loaded["model"]["args"], {"a": 1, "b": 9})
+        self.assertEqual(loaded["value"], 3)
 
 
 def _hypes():

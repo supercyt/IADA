@@ -11,6 +11,44 @@ import math
 import numpy as np
 
 
+def _deep_merge_yaml(base, override):
+    """Recursively merge YAML mappings while replacing non-mapping values."""
+
+    merged = dict(base)
+    for key, value in override.items():
+        if (
+            key in merged
+            and isinstance(merged[key], dict)
+            and isinstance(value, dict)
+        ):
+            merged[key] = _deep_merge_yaml(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _load_yaml_with_base(file, loader, stack=()):
+    absolute_file = os.path.abspath(file)
+    if absolute_file in stack:
+        chain = " -> ".join(stack + (absolute_file,))
+        raise ValueError(f"Cyclic YAML base_config chain: {chain}")
+    with open(absolute_file, "r") as stream:
+        param = yaml.load(stream, Loader=loader)
+    if not isinstance(param, dict):
+        raise TypeError(f"YAML root must be a mapping: {absolute_file}")
+    base_config = param.pop("base_config", None)
+    if base_config is None:
+        return param
+    if not isinstance(base_config, str) or not base_config:
+        raise ValueError("base_config must be a non-empty path string")
+    if not os.path.isabs(base_config):
+        base_config = os.path.join(os.path.dirname(absolute_file), base_config)
+    base = _load_yaml_with_base(
+        base_config, loader, stack + (absolute_file,)
+    )
+    return _deep_merge_yaml(base, param)
+
+
 def load_yaml(file, opt=None):
     """
     Load yaml file and return a dictionary.
@@ -30,7 +68,6 @@ def load_yaml(file, opt=None):
     if opt and opt.model_dir:
         file = os.path.join(opt.model_dir, 'config.yaml')
 
-    stream = open(file, 'r')
     loader = yaml.Loader
     loader.add_implicit_resolver(
         u'tag:yaml.org,2002:float',
@@ -42,7 +79,7 @@ def load_yaml(file, opt=None):
         |[-+]?\\.(?:inf|Inf|INF)
         |\\.(?:nan|NaN|NAN))$''', re.X),
         list(u'-+0123456789.'))
-    param = yaml.load(stream, Loader=loader)
+    param = _load_yaml_with_base(file, loader)
     if "yaml_parser" in param:
         param = eval(param["yaml_parser"])(param)
 

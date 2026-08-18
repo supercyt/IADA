@@ -182,6 +182,8 @@ class PointPillarBaseline(nn.Module):
                     fused_feature,
                     record_len,
                     data_dict.get('grl_lambda', 1.0),
+                    pairwise_t_matrix=data_dict['pairwise_t_matrix'],
+                    adapter_domain=data_dict.get('adapter_domain'),
                 )
             adaptation_context.update(fused_context)
 
@@ -196,6 +198,35 @@ class PointPillarBaseline(nn.Module):
 
         if self.domain_adapter is not None:
             adapter_domain = data_dict.get('adapter_domain')
+            if self.domain_adapter.method == 'iada':
+                ego_feature = adaptation_context['iada_ego_features']
+                adaptation_context['iada_ego_cls_preds'] = self.cls_head(
+                    ego_feature
+                )
+                adaptation_context['iada_ego_reg_preds'] = self.reg_head(
+                    ego_feature
+                )
+                consistency_feature = adaptation_context.get(
+                    'iada_consistency_features'
+                )
+                if consistency_feature is not None:
+                    adaptation_context['iada_consistency_cls_preds'] = (
+                        self.cls_head(consistency_feature)
+                    )
+                    adaptation_context['iada_consistency_reg_preds'] = (
+                        self.reg_head(consistency_feature)
+                    )
+                teacher_feature = adaptation_context.get(
+                    'iada_teacher_features'
+                )
+                if teacher_feature is not None:
+                    with torch.no_grad():
+                        adaptation_context['iada_teacher_cls_preds'] = (
+                            self.cls_head(teacher_feature)
+                        )
+                        adaptation_context['iada_teacher_reg_preds'] = (
+                            self.reg_head(teacher_feature)
+                        )
             agent_confidence_logits = None
             needs_confidence = self.domain_adapter.requires_agent_confidence
             if (
