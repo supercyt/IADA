@@ -869,7 +869,7 @@ def remove_large_pred_bbx(bbx_3d):
     return index
 
 
-def remove_bbx_abnormal_z(bbx_3d):
+def remove_bbx_abnormal_z(bbx_3d, z_min=-3, z_max=1):
     """
     Remove bounding box that has negative z axis.
 
@@ -885,7 +885,7 @@ def remove_bbx_abnormal_z(bbx_3d):
     """
     bbx_z_min = torch.min(bbx_3d[:, :, 2], dim=1)[0]
     bbx_z_max = torch.max(bbx_3d[:, :, 2], dim=1)[0]
-    index = torch.logical_and(bbx_z_min >= -3, bbx_z_max <= 1)
+    index = torch.logical_and(bbx_z_min >= z_min, bbx_z_max <= z_max)
 
     return index
 
@@ -1271,4 +1271,3 @@ def project_world_visible_objects(object_dict,
 
         if bbx_lidar.shape[0] > 0 and box_is_visible(bbx_lidar, visibility_map):
             output_dict.update({object_id: bbx_lidar})
-

@@ -5,7 +5,9 @@
 
 import argparse
 import os
+import shlex
 import statistics
+import sys
 
 import torch
 from torch.utils.data import DataLoader, Subset
@@ -187,9 +189,13 @@ def main():
     if run_test:
         fusion_method = opt.fusion_method
         if 'noise_setting' in hypes and hypes['noise_setting']['add_noise']:
-            cmd = f"python opencood/tools/inference_w_noise.py --model_dir {saved_path} --fusion_method {fusion_method}"
+            cmd = (f"{shlex.quote(sys.executable)} opencood/tools/inference_w_noise.py "
+                   f"--model_dir {shlex.quote(saved_path)} "
+                   f"--fusion_method {shlex.quote(fusion_method)}")
         else:
-            cmd = f"python opencood/tools/inference.py --model_dir {saved_path} --fusion_method {fusion_method}"
+            cmd = (f"{shlex.quote(sys.executable)} opencood/tools/inference.py "
+                   f"--model_dir {shlex.quote(saved_path)} "
+                   f"--fusion_method {shlex.quote(fusion_method)}")
         print(f"Running command: {cmd}")
         os.system(cmd)
 

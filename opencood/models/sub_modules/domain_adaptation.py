@@ -585,9 +585,13 @@ class IADAAdapter(FusionAgnosticDomainAdapter):
         if ego_features.shape != fused_features.shape:
             raise ValueError("IADA ego and fused feature shapes must match")
         raw_innovation = fused_features - ego_features
-        normalized_innovation = self._channel_normalize(
-            fused_features
-        ) - self._channel_normalize(ego_features)
+        # Adapter context should not create an auxiliary shortcut into the
+        # warm-started detector.  Detection gradients still reach the detector
+        # through ``raw_innovation`` in ``calibrated`` below.
+        normalized_innovation = (
+            self._channel_normalize(fused_features)
+            - self._channel_normalize(ego_features)
+        ).detach()
         geometry, range_index = self._geometry_context(
             record_len, pairwise_t_matrix, fused_features
         )
@@ -605,6 +609,10 @@ class IADAAdapter(FusionAgnosticDomainAdapter):
             "iada_utility_logits": self.utility_head(effect),
             "iada_gate_mean": gate.mean().reshape(1),
             "iada_gate_deviation": (gate - 1.0).abs().mean().reshape(1),
+            "iada_gate_saturation": (
+                (gate - 1.0).abs()
+                >= max(0.95 * self.gate_limit, 1.0e-6)
+            ).to(gate.dtype).mean().reshape(1),
             "iada_range_index": range_index,
         }
 
@@ -666,6 +674,7 @@ class IADAAdapter(FusionAgnosticDomainAdapter):
             "iada_utility_logits",
             "iada_gate_mean",
             "iada_gate_deviation",
+            "iada_gate_saturation",
             "iada_range_index",
             "iada_ego_cls_preds",
             "iada_ego_reg_preds",

@@ -17,6 +17,7 @@ from opencood.tools.train_iada import (
     _balanced_domain_loss,
     _build_clean_validation_config,
     _configure_stage,
+    _combine_domain_metrics,
     _find_model_checkpoint,
     _graph_variance_floor_loss,
     _grl_lambda,
@@ -31,6 +32,8 @@ from opencood.tools.train_iada import (
     _slice_detection_output,
     _validate_baseline_warm_start,
     _validate_detection,
+    _target_adapter_only_parameters,
+    _trainable_adapter_parameters,
 )
 
 
@@ -515,6 +518,57 @@ class ValidationTest(unittest.TestCase):
 
 
 class StageOptimizerTest(unittest.TestCase):
+    def test_source_auxiliary_backward_updates_only_adapter(self):
+        model = _WarmStartModel()
+        inputs = torch.ones(2, 2)
+        shared = model.encoder(inputs)
+        detection_loss = shared.square().mean()
+        adaptation_loss = model.domain_adapter(shared).square().mean()
+
+        detection_loss.backward(retain_graph=True)
+        detector_gradient = model.encoder.weight.grad.clone()
+        adaptation_loss.backward(inputs=_trainable_adapter_parameters(model))
+
+        torch.testing.assert_close(
+            model.encoder.weight.grad, detector_gradient
+        )
+        self.assertIsNotNone(model.domain_adapter.weight.grad)
+
+    def test_target_adapter_only_scope_blocks_shared_detector_gradients(self):
+        model = _WarmStartModel()
+        inputs = torch.ones(2, 2)
+
+        with _target_adapter_only_parameters(model, enabled=True):
+            output = model.domain_adapter(model.encoder(inputs))
+            output.sum().backward()
+
+        self.assertIsNone(model.encoder.weight.grad)
+        self.assertIsNone(model.encoder.bias.grad)
+        self.assertIsNotNone(model.domain_adapter.weight.grad)
+        self.assertTrue(model.encoder.weight.requires_grad)
+
+    def test_metric_combination_averages_gate_diagnostics(self):
+        combined = _combine_domain_metrics(
+            {
+                "domain_loss": torch.tensor(0.2),
+                "iada_gate_mean": torch.tensor(0.8),
+                "iada_gate_saturation": torch.tensor(0.1),
+            },
+            {
+                "domain_loss": torch.tensor(0.3),
+                "iada_gate_mean": torch.tensor(1.2),
+                "iada_gate_saturation": torch.tensor(0.3),
+            },
+        )
+
+        torch.testing.assert_close(combined["domain_loss"], torch.tensor(0.5))
+        torch.testing.assert_close(
+            combined["iada_gate_mean"], torch.tensor(1.0)
+        )
+        torch.testing.assert_close(
+            combined["iada_gate_saturation"], torch.tensor(0.2)
+        )
+
     def test_scratch_adaptation_uses_base_lr_for_every_parameter(self):
         model = _WarmStartModel()
         hypes = {

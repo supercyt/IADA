@@ -370,7 +370,13 @@ class VoxelPostprocessor(BasePostprocessor):
         pred_box3d_tensor = torch.vstack(pred_box3d_list)
         # remove large bbx
         keep_index_1 = box_utils.remove_large_pred_bbx(pred_box3d_tensor)
-        keep_index_2 = box_utils.remove_bbx_abnormal_z(pred_box3d_tensor)
+        # The original OPV2V implementation hard-coded [-3, 1] here.  Real
+        # datasets can use a different vertical range, so use the configured
+        # post-processing range instead of silently discarding valid boxes.
+        gt_range = self.params['gt_range']
+        keep_index_2 = box_utils.remove_bbx_abnormal_z(
+            pred_box3d_tensor, z_min=gt_range[2], z_max=gt_range[5]
+        )
         keep_index = torch.logical_and(keep_index_1, keep_index_2)
 
         pred_box3d_tensor = pred_box3d_tensor[keep_index]

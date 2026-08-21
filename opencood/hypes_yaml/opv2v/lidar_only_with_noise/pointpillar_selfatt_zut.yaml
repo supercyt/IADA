@@ -1,66 +1,61 @@
-name: opv2v_point_pillar_lidar_selfatt_withnoise
-root_dir: "/home/caoyitong/DataProjects/v2x_datasets/my_dair_v2x/v2x_c/cooperative-vehicle-infrastructure/train.json"
-validate_dir: "/home/caoyitong/DataProjects/v2x_datasets/my_dair_v2x/v2x_c/cooperative-vehicle-infrastructure/val.json"
-test_dir: "/home/caoyitong/DataProjects/v2x_datasets/my_dair_v2x/v2x_c/cooperative-vehicle-infrastructure/val.json"
+name: zut_opv2v_point_pillar_selfatt
+root_dir: "/home/caoyitong/DataProjects/v2x_datasets/ZUT_OPV2V/train"
+validate_dir: "/home/caoyitong/DataProjects/v2x_datasets/ZUT_OPV2V/validate"
+# train.py automatically evaluates this labeled mirror after training.
+test_dir: "/home/caoyitong/DataProjects/v2x_datasets/ZUT_OPV2V/test_labeled"
 
 noise_setting:
-  add_noise: True
-  args: 
-    pos_std: 0.2
-    rot_std: 0.2
-    pos_mean: 0
-    rot_mean: 0
+  add_noise: false
+  args:
+    pos_std: 0.0
+    rot_std: 0.0
+    pos_mean: 0.0
+    rot_mean: 0.0
 
 yaml_parser: "load_point_pillar_params"
 train_params:
   batch_size: &batch_size 4
-  epoches: 20
-  eval_freq: 2
+  epoches: 200
+  eval_freq: 1
   save_freq: 2
-  max_cav: &max_cav 5
+  max_cav: &max_cav 2
+
+# ZUT inference and annotation use the front acquisition vehicle as ego.
+fixed_ego_id: '0'
 
 input_source: ['lidar']
 label_type: 'lidar'
-
 comm_range: 70
 
 fusion:
   core_method: 'intermediate'
   dataset: 'opv2v'
-  args: 
+  args:
     proj_first: false
 
-# preprocess-related
 preprocess:
-  # options: BasePreprocessor, VoxelPreprocessor, BevPreprocessor
   core_method: 'SpVoxelPreprocessor'
   args:
-    voxel_size: &voxel_size [0.4, 0.4, 4]
+    voxel_size: &voxel_size [0.4, 0.4, 8]
     max_points_per_voxel: 32
     max_voxel_train: 32000
     max_voxel_test: 70000
-  # lidar range for each individual cav.
-  cav_lidar_range: &cav_lidar [-140.8, -40, -3, 140.8, 40, 1]
+  cav_lidar_range: &cav_lidar [-64, -32, -4, 64, 32, 4]
 
-data_augment:
-  - NAME: random_world_flip
-    ALONG_AXIS_LIST: [ 'x' ]
+# With proj_first=false, applying the same transform independently in each
+# CAV-local frame does not preserve the pairwise transform.  Keep geometry
+# unchanged until augmentation is implemented in the common ego frame.
+data_augment: []
 
-  - NAME: random_world_rotation
-    WORLD_ROT_ANGLE: [ -0.78539816, 0.78539816 ]
-
-  - NAME: random_world_scaling
-    WORLD_SCALE_RANGE: [ 0.95, 1.05 ]
-
-# anchor box related
 postprocess:
-  core_method: 'VoxelPostprocessor' # VoxelPostprocessor, BevPostprocessor supported
+  core_method: 'VoxelPostprocessor'
   gt_range: *cav_lidar
   anchor_args:
     cav_lidar_range: *cav_lidar
-    l: 3.9
-    w: 1.6
-    h: 1.56
+    # Median canonical Car dimensions in experiment_1_resynced.
+    l: 4.32
+    w: 2.02
+    h: 1.77
     r: &anchor_yaw [0, 90]
     feature_stride: 2
     num: &anchor_num 2
@@ -68,22 +63,20 @@ postprocess:
     pos_threshold: 0.6
     neg_threshold: 0.45
     score_threshold: 0.20
-  order: 'hwl' # hwl or lwh
-  max_num: 100 # maximum number of objects in a single frame. use this number to make sure different frames has the same dimension in the same batch
+  order: 'hwl'
+  max_num: 32
   nms_thresh: 0.15
   dir_args: &dir_args
     dir_offset: 0.7853
     num_bins: 2
     anchor_yaw: *anchor_yaw
 
-# model related
 model:
   core_method: point_pillar_intermediate
   args:
     voxel_size: *voxel_size
     lidar_range: *cav_lidar
     anchor_number: *anchor_num
-
     pillar_vfe:
       use_norm: true
       with_distance: false
@@ -91,18 +84,14 @@ model:
       num_filters: [64]
     point_pillar_scatter:
       num_features: 64
-
-    base_bev_backbone: # backbone will downsample 2x
+    base_bev_backbone:
       voxel_size: *voxel_size
       layer_nums: [3, 5, 8]
       layer_strides: [2, 2, 2]
       num_filters: [64, 128, 256]
       upsample_strides: [1, 2, 4]
       num_upsample_filter: [128, 128, 128]
-
-
     dir_args: *dir_args
-
 
 loss:
   core_method: point_pillar_loss
@@ -127,11 +116,10 @@ optimizer:
   core_method: Adam
   lr: 0.002
   args:
-    eps: 1e-10
-    weight_decay: 1e-4
+    eps: 1.0e-10
+    weight_decay: 1.0e-4
 
 lr_scheduler:
-  core_method: multistep #step, multistep and Exponential support
+  core_method: multistep
   gamma: 0.1
-  step_size: [10, 15]
-
+  step_size: [140, 180]

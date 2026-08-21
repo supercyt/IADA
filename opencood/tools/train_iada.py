@@ -1,6 +1,7 @@
 """Train fusion-agnostic OPV2V-to-DAIR domain adaptation baselines."""
 
 import argparse
+import contextlib
 import copy
 import glob
 import math
@@ -660,13 +661,48 @@ def _combine_domain_metrics(source_metrics, target_metrics):
         tensor_values = [value for value in values if torch.is_tensor(value)]
         if not tensor_values:
             continue
-        if "accuracy" in key:
+        if (
+            "accuracy" in key
+            or key.endswith("_mean")
+            or key.endswith("_deviation")
+            or key.endswith("_saturation")
+        ):
             combined[key] = torch.stack(tensor_values).nanmean()
         elif key == "graph_variance_update_applied":
             combined[key] = torch.stack(tensor_values).amin()
         else:
             combined[key] = torch.stack(tensor_values).sum()
     return combined
+
+
+@contextlib.contextmanager
+def _target_adapter_only_parameters(model, enabled):
+    """Prevent unlabeled target losses from updating the shared detector."""
+
+    if not enabled:
+        yield
+        return
+    temporarily_frozen = []
+    for name, parameter in model.named_parameters():
+        if parameter.requires_grad and not name.startswith(
+            ("domain_adapter.", "interaction_da.")
+        ):
+            parameter.requires_grad_(False)
+            temporarily_frozen.append(parameter)
+    try:
+        yield
+    finally:
+        for parameter in temporarily_frozen:
+            parameter.requires_grad_(True)
+
+
+def _trainable_adapter_parameters(model):
+    return [
+        parameter
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+        and name.startswith(("domain_adapter.", "interaction_da."))
+    ]
 
 
 def _iada_variance_is_enabled(
@@ -1091,6 +1127,23 @@ def main():
     best_validation_path = _resolve_best_validation_path(
         saved_path, resume_state
     )
+    if (
+        resume_state is None
+        and not opt.model_dir
+        and stage != "baseline"
+        and initialization == "baseline_warm_start"
+    ):
+        best_validation_loss = _validate_source(
+            model, criterion, source_validate_loader, device
+        )
+        best_validation_path = os.path.join(
+            saved_path, "net_epoch_bestval_at0.pth"
+        )
+        _atomic_torch_save(model.state_dict(), best_validation_path)
+        print(
+            "Warm-start reference before adaptation: source validation loss "
+            f"{best_validation_loss:.4f}"
+        )
     if legacy_resume and best_validation_path is not None:
         _load_model_checkpoint(
             model,
@@ -1224,40 +1277,63 @@ def main():
             # target graph. Gradients remain accumulated until the single
             # optimizer step below, while the large source activations can be
             # released before target V2X-ViT attention runs.
-            scaler.scale(source_total_loss).backward()
+            source_adapter_only = (
+                stage == "iada"
+                and use_target
+                and bool(da_cfg.get("iada_source_adapter_only", True))
+            )
+            if source_adapter_only:
+                adapter_parameters = _trainable_adapter_parameters(model)
+                if not adapter_parameters:
+                    raise RuntimeError(
+                        "IADA source adapter-only training found no trainable "
+                        "adapter parameters"
+                    )
+                scaler.scale(detection_loss).backward(retain_graph=True)
+                scaler.scale(source_adaptation_loss).backward(
+                    inputs=adapter_parameters
+                )
+            else:
+                scaler.scale(source_total_loss).backward()
             detection_loss = detection_loss.detach()
             source_adaptation_loss = source_adaptation_loss.detach()
             source_metrics = _detach_metrics(source_metrics)
             del detection_output, source_output, source_total_loss
 
             if use_target:
-                with torch.amp.autocast("cuda", enabled=amp_enabled):
-                    target_output = model(target_model_inputs)
-                    target_adaptation_loss, target_metrics = (
-                        compute_single_domain_adaptation_loss(
-                            stage,
-                            "target",
-                            target_output,
-                            target_model_inputs["record_len"],
-                            None,
-                            da_cfg,
-                            iada_domain_enabled=iada_domain_enabled,
-                            iada_variance_enabled=iada_variance_enabled,
+                target_adapter_only = stage == "iada" and bool(
+                    da_cfg.get("iada_target_adapter_only", True)
+                )
+                with _target_adapter_only_parameters(
+                    model, target_adapter_only
+                ):
+                    with torch.amp.autocast("cuda", enabled=amp_enabled):
+                        target_output = model(target_model_inputs)
+                        target_adaptation_loss, target_metrics = (
+                            compute_single_domain_adaptation_loss(
+                                stage,
+                                "target",
+                                target_output,
+                                target_model_inputs["record_len"],
+                                None,
+                                da_cfg,
+                                iada_domain_enabled=iada_domain_enabled,
+                                iada_variance_enabled=iada_variance_enabled,
+                            )
                         )
-                    )
-                    if "graph_embedding" in target_output:
-                        target_graph = target_output["graph_embedding"]
-                        target_metrics["graph_embedding_norm"] = (
-                            0.5 * target_graph.norm(dim=1).mean()
-                        )
-                        target_metrics["graph_embedding_variance"] = (
-                            0.5
-                            * target_graph.var(
-                                dim=0, unbiased=False
-                            ).mean()
-                        )
+                        if "graph_embedding" in target_output:
+                            target_graph = target_output["graph_embedding"]
+                            target_metrics["graph_embedding_norm"] = (
+                                0.5 * target_graph.norm(dim=1).mean()
+                            )
+                            target_metrics["graph_embedding_variance"] = (
+                                0.5
+                                * target_graph.var(
+                                    dim=0, unbiased=False
+                                ).mean()
+                            )
 
-                scaler.scale(target_adaptation_loss).backward()
+                    scaler.scale(target_adaptation_loss).backward()
                 target_adaptation_loss = target_adaptation_loss.detach()
                 target_metrics = _detach_metrics(target_metrics)
                 del target_output
@@ -1322,6 +1398,30 @@ def main():
                     if not torch.isnan(domain_accuracy)
                     else "n/a"
                 )
+                iada_details = []
+                if stage == "iada":
+                    for metric_name, label in (
+                        ("iada_safe_loss", "safe"),
+                        ("iada_correction_loss", "corr"),
+                        ("iada_utility_loss", "util"),
+                        ("iada_consistency_loss", "cons"),
+                        ("iada_effect_loss", "effect"),
+                        ("iada_target_selected_fraction", "selected"),
+                        ("iada_gate_deviation", "gate_dev"),
+                        ("iada_gate_saturation", "gate_sat"),
+                    ):
+                        metric = adaptation_metrics.get(metric_name)
+                        if (
+                            torch.is_tensor(metric)
+                            and metric.numel() == 1
+                            and torch.isfinite(metric).item()
+                        ):
+                            iada_details.append(
+                                f"{label}={metric.item():.4f}"
+                            )
+                detail_text = (
+                    " " + " ".join(iada_details) if iada_details else ""
+                )
                 print(
                     f"[epoch {epoch}][{step + 1}/{steps_per_epoch}] "
                     f"total={total_loss.item():.4f} "
@@ -1329,6 +1429,7 @@ def main():
                     f"domain={domain_loss.item():.4f} "
                     f"domain_acc={accuracy_text} "
                     f"grl={current_grl:.4f}"
+                    f"{detail_text}"
                 )
 
         if epoch % int(hypes["train_params"]["eval_freq"]) == 0:

@@ -770,8 +770,12 @@ class AdaptationLossTest(unittest.TestCase):
         output = {
             "cls_preds": fused_cls,
             "reg_preds": fused_reg,
-            "iada_ego_cls_preds": torch.full((1, 2, 1, 1), -0.5),
-            "iada_ego_reg_preds": torch.zeros(1, 14, 1, 1),
+            "iada_ego_cls_preds": torch.full(
+                (1, 2, 1, 1), -0.5, requires_grad=True
+            ),
+            "iada_ego_reg_preds": torch.zeros(
+                1, 14, 1, 1, requires_grad=True
+            ),
             "iada_utility_logits": torch.zeros(
                 1, 2, 1, 1, requires_grad=True
             ),
@@ -802,10 +806,14 @@ class AdaptationLossTest(unittest.TestCase):
         self.assertGreater(loss.item(), 0.0)
         self.assertGreater(metrics["iada_safe_loss"].item(), 0.0)
         self.assertGreater(metrics["iada_correction_loss"].item(), 0.0)
-        self.assertGreater(counts.sum().item(), 0.0)
+        # A fused prediction that is worse than ego-only must not seed a
+        # "discovery" prototype merely because the ego confidence is low.
+        self.assertEqual(counts.sum().item(), 0.0)
         loss.backward()
         self.assertGreater(fused_cls.grad.abs().sum().item(), 0.0)
         self.assertGreater(fused_reg.grad.abs().sum().item(), 0.0)
+        self.assertIsNone(output["iada_ego_cls_preds"].grad)
+        self.assertIsNone(output["iada_ego_reg_preds"].grad)
 
     def test_iada_target_consistency_uses_advantage_not_absolute_logits(self):
         student_cls = torch.full(
@@ -815,8 +823,12 @@ class AdaptationLossTest(unittest.TestCase):
         output = {
             "cls_preds": torch.zeros(1, 2, 1, 1, requires_grad=True),
             "reg_preds": torch.zeros(1, 14, 1, 1),
-            "iada_ego_cls_preds": torch.zeros(1, 2, 1, 1),
-            "iada_ego_reg_preds": torch.zeros(1, 14, 1, 1),
+            "iada_ego_cls_preds": torch.zeros(
+                1, 2, 1, 1, requires_grad=True
+            ),
+            "iada_ego_reg_preds": torch.zeros(
+                1, 14, 1, 1, requires_grad=True
+            ),
             "iada_consistency_cls_preds": student_cls,
             "iada_consistency_reg_preds": student_reg,
             "iada_teacher_cls_preds": torch.full((1, 2, 1, 1), 2.0),
@@ -840,6 +852,8 @@ class AdaptationLossTest(unittest.TestCase):
         loss.backward()
         self.assertGreater(student_cls.grad.abs().sum().item(), 0.0)
         self.assertGreater(student_reg.grad.abs().sum().item(), 0.0)
+        self.assertIsNone(output["iada_ego_cls_preds"].grad)
+        self.assertIsNone(output["iada_ego_reg_preds"].grad)
 
     def test_loss_dispatch_matches_supported_methods(self):
         labels = torch.tensor([0.0, 1.0])

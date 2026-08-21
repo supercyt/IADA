@@ -84,7 +84,20 @@ class OPV2VBaseDataset(Dataset):
             self.scenario_database.update({i: OrderedDict()})
 
             # at least 1 cav should show up
-            if self.train:
+            fixed_ego_id = self.params.get('fixed_ego_id')
+            if fixed_ego_id is not None:
+                fixed_ego_id = str(fixed_ego_id)
+                cav_list = sorted(
+                    [x for x in os.listdir(scenario_folder)
+                     if os.path.isdir(os.path.join(scenario_folder, x))],
+                    key=lambda cav_id: (cav_id != fixed_ego_id, cav_id)
+                )
+                if not cav_list or cav_list[0] != fixed_ego_id:
+                    raise ValueError(
+                        f'fixed_ego_id {fixed_ego_id!r} is absent from '
+                        f'{scenario_folder}'
+                    )
+            elif self.train:
                 cav_list = [x for x in os.listdir(scenario_folder)
                             if os.path.isdir(
                         os.path.join(scenario_folder, x))]

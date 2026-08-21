@@ -219,6 +219,10 @@ domain_adaptation:
   iada_utility_weight: 0.1
   iada_consistency_weight: 0.1
   iada_effect_weight: 0.05
+  # IADA auxiliary objectives update only the fresh adapter. The ordinary
+  # labeled source detection loss remains responsible for detector fine-tuning.
+  iada_source_adapter_only: true
+  iada_target_adapter_only: true
   iada_safe_margin: 0.0
   iada_target_confidence_threshold: 0.6
   iada_target_advantage_threshold: 0.03

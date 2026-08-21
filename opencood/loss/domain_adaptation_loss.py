@@ -520,6 +520,7 @@ def _iada_source_effect_memory_update(
     ego_cls: torch.Tensor,
     fused_cls: torch.Tensor,
     ego_reg_error: torch.Tensor,
+    fused_reg_error: torch.Tensor,
     config: Mapping[str, object],
 ) -> int:
     """Update source-only discovery/suppression/refinement prototypes."""
@@ -549,8 +550,11 @@ def _iada_source_effect_memory_update(
     positive_spatial = positive.any(dim=-1)
     negative_spatial = negative.any(dim=-1)
     positive_count = positive.sum(dim=-1).clamp_min(1)
-    refinement_error = (
+    ego_refinement_error = (
         ego_reg_error * positive.to(ego_reg_error.dtype)
+    ).sum(dim=-1) / positive_count
+    fused_refinement_error = (
+        fused_reg_error.detach() * positive.to(fused_reg_error.dtype)
     ).sum(dim=-1) / positive_count
     discovery_threshold = float(
         config.get("iada_discovery_ego_threshold", 0.5)
@@ -558,13 +562,26 @@ def _iada_source_effect_memory_update(
     refinement_threshold = float(
         config.get("iada_refinement_error_threshold", 0.1)
     )
-    masks = (
-        positive_spatial & (ego_max < discovery_threshold),
+    advantage_threshold = float(
+        config.get("iada_target_advantage_threshold", 0.03)
+    )
+    discovery = (
+        positive_spatial
+        & (ego_max < discovery_threshold)
+        & (fused_max - ego_max >= advantage_threshold)
+    )
+    suppression = (
         negative_spatial
         & (ego_max > discovery_threshold)
-        & (fused_max < ego_max),
-        positive_spatial & (refinement_error > refinement_threshold),
+        & (ego_max - fused_max >= advantage_threshold)
     )
+    refinement = (
+        positive_spatial
+        & ~discovery
+        & (ego_refinement_error > refinement_threshold)
+        & (ego_refinement_error > fused_refinement_error)
+    )
+    masks = (discovery, suppression, refinement)
     range_index = output_dict["iada_range_index"].long()
     momentum = float(
         output_dict.get(
@@ -640,14 +657,28 @@ def iada_source_adaptation_loss(
         ego_reg, targets, reduction="none"
     ).mean(dim=-1).detach()
     margin = float(config.get("iada_safe_margin", 0.0))
-    safe_cls = F.relu(fused_cls_error - ego_cls_error + margin)[valid].mean()
+    safe_cls_terms = []
+    for mask in (positive, valid & ~positive):
+        if bool(mask.any().item()):
+            safe_cls_terms.append(
+                F.relu(fused_cls_error - ego_cls_error + margin)[mask].mean()
+            )
+    safe_cls = (
+        torch.stack(safe_cls_terms).mean()
+        if safe_cls_terms
+        else fused_cls_raw.sum() * 0.0
+    )
     if bool(positive.any().item()):
         safe_reg = F.relu(
             fused_reg_error - ego_reg_error + margin
         )[positive].mean()
-        correction_target = (targets - ego_reg.detach())[positive]
+        # The ego prediction is a fixed counterfactual reference.  Detaching it
+        # on only the target side leaves a spurious ``-grad(ego_reg)`` term even
+        # though ego_reg cancels algebraically in the forward value.
+        ego_reg_reference = ego_reg.detach()
+        correction_target = (targets - ego_reg_reference)[positive]
         correction_loss = F.smooth_l1_loss(
-            (fused_reg - ego_reg)[positive], correction_target
+            (fused_reg - ego_reg_reference)[positive], correction_target
         )
     else:
         safe_reg = fused_reg_raw.sum() * 0.0
@@ -673,6 +704,7 @@ def iada_source_adaptation_loss(
         ego_cls,
         fused_cls,
         ego_reg_error,
+        fused_reg_error,
         config,
     )
     total = (
@@ -690,6 +722,9 @@ def iada_source_adaptation_loss(
         "iada_gate_deviation": output_dict[
             "iada_gate_deviation"
         ].mean(),
+        "iada_gate_saturation": output_dict.get(
+            "iada_gate_saturation", total.new_zeros(())
+        ).mean(),
         "domain_loss": total,
         "domain_accuracy": total.new_tensor(float("nan")),
     }
@@ -743,13 +778,21 @@ def iada_target_adaptation_loss(
         )
         selected_count = int(reliable.sum().item())
         if selected_count:
-            student_advantage = student_cls.sigmoid() - ego_cls.sigmoid()
+            # Keep the ego-only counterfactual fixed on both sides.  Otherwise
+            # the numerically cancelling ego terms inject an unintended
+            # negative gradient into the shared detector on unlabeled target
+            # data.
+            ego_cls_reference = ego_cls.detach()
+            ego_reg_reference = ego_reg.detach()
+            student_advantage = (
+                student_cls.sigmoid() - ego_cls_reference.sigmoid()
+            )
             consistency_cls = F.smooth_l1_loss(
                 student_advantage[reliable], teacher_advantage[reliable]
             )
             anchor_mask = reliable.repeat_interleave(7, dim=1)
             consistency_reg = F.smooth_l1_loss(
-                (student_reg - ego_reg)[anchor_mask],
+                (student_reg - ego_reg_reference)[anchor_mask],
                 teacher_reg_advantage[anchor_mask],
             )
             consistency_loss = consistency_cls + consistency_reg
@@ -806,10 +849,16 @@ def iada_target_adaptation_loss(
         "iada_consistency_loss": consistency_loss,
         "iada_effect_loss": effect_loss,
         "iada_target_selected": total.new_tensor(selected_count),
+        "iada_target_selected_fraction": reliable.to(total.dtype).mean()
+        if teacher_keys.issubset(output_dict)
+        else total.new_zeros(()),
         "iada_gate_mean": output_dict["iada_gate_mean"].mean(),
         "iada_gate_deviation": output_dict[
             "iada_gate_deviation"
         ].mean(),
+        "iada_gate_saturation": output_dict.get(
+            "iada_gate_saturation", total.new_zeros(())
+        ).mean(),
         "domain_loss": total,
         "domain_accuracy": total.new_tensor(float("nan")),
     }
