@@ -139,7 +139,7 @@ logs/
 *.pyc
 
 dataset
-opencood/logs
+opencood/logs*
 images/
 data_vis_dariv2x/
 data_vis_v2xsim/

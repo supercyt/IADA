@@ -1,0 +1,49 @@
+# v2x-vit basline
+nohup env CUDA_VISIBLE_DEVICES=0 uv run python opencood/tools/train_iada.py --hypes_yaml opencood/hypes_yaml/domain_adaptation/source/pointpillar_v2xvit_da.yaml --stage baseline > training_logs/v2xvit_opv2v_baseline.log 2>&1 &
+# attfuse basline
+nohup env CUDA_VISIBLE_DEVICES=1 uv run python opencood/tools/train_iada.py --hypes_yaml opencood/hypes_yaml/domain_adaptation/source/pointpillar_attfuse_iada.yaml --stage baseline > training_logs/attfuse_opv2v_baseline.log 2>&1 &
+
+#  v2x-vit GRL adaption
+nohup env CUDA_VISIBLE_DEVICES=0 uv run python opencood/tools/train_iada.py --hypes_yaml opencood/hypes_yaml/domain_adaptation/opv2v_to_dair/pointpillar_v2xvit_da.yaml --stage grl --pretrained_model_dir "$(ls -dt opencood/logs/opv2v_to_dairv2x_pointpillar_v2xvit_da_baseline_* | head -n 1)" --half > training_logs/v2xvit_grl.log 2>&1 &
+#  v2x-vit dusa adaption
+nohup env CUDA_VISIBLE_DEVICES=1 uv run python opencood/tools/train_iada.py --hypes_yaml opencood/hypes_yaml/domain_adaptation/opv2v_to_dair/pointpillar_v2xvit_da.yaml --stage dusa --pretrained_model_dir "$(ls -dt opencood/logs/opv2v_to_dairv2x_pointpillar_v2xvit_da_baseline_* | head -n 1)" --half > training_logs/v2xvit_dusa.log 2>&1 &
+#  v2x-vit cuda-x adaption
+nohup env CUDA_VISIBLE_DEVICES=0 uv run python opencood/tools/train_iada.py --hypes_yaml opencood/hypes_yaml/domain_adaptation/opv2v_to_dair/pointpillar_v2xvit_da.yaml --stage cudax --pretrained_model_dir "$(ls -dt opencood/logs/opv2v_to_dairv2x_pointpillar_v2xvit_da_baseline_* | head -n 1)"  --half > training_logs/v2xvit_cudax.log 2>&1 &
+#  v2x-vit ssda adaption
+nohup env CUDA_VISIBLE_DEVICES=1 uv run python opencood/tools/train_iada.py --hypes_yaml opencood/hypes_yaml/domain_adaptation/opv2v_to_dair/pointpillar_v2xvit_da.yaml --stage ssda --pretrained_model_dir "$(ls -dt opencood/logs/opv2v_to_dairv2x_pointpillar_v2xvit_da_baseline_* | head -n 1)" --half > training_logs/v2xvit_ssda.log 2>&1 &
+#  v2x-vit iada adaption
+nohup env CUDA_VISIBLE_DEVICES=0 uv run python opencood/tools/train_iada.py --hypes_yaml opencood/hypes_yaml/domain_adaptation/opv2v_to_dair/pointpillar_v2xvit_da.yaml --stage iada --pretrained_model_dir "$(ls -dt opencood/logs/opv2v_to_dairv2x_pointpillar_v2xvit_da_baseline_* | head -n 1)" --half > training_logs/v2xvit_iada.log 2>&1 &
+
+
+# Attfuse GRL adaption
+nohup env CUDA_VISIBLE_DEVICES=1 uv run python opencood/tools/train_iada.py --hypes_yaml opencood/hypes_yaml/domain_adaptation/opv2v_to_dair/pointpillar_attfuse_iada.yaml --stage grl --pretrained_model_dir "$(ls -dt opencood/logs/opv2v_to_dairv2x_pointpillar_attfuse_da_baseline_* | head -n 1)" --half > training_logs/attfuse_grl.log 2>&1 &
+
+CUDA_VISIBLE_DEVICES=0 python opencood/tools/inference.py --model_dir opencood/logs/opv2v_to_dairv2x_pointpillar_attfuse_da_baseline_2026_08_12_11_19_29 --fusion_method intermediate
+CUDA_VISIBLE_DEVICES=1 python opencood/tools/inference.py --model_dir opencood/logs/opv2v_to_dairv2x_pointpillar_attfuse_da_grl_2026_08_12_23_05_24 --fusion_method intermediate --note grl
+
+# inference basline
+CUDA_VISIBLE_DEVICES=0 python opencood/tools/inference.py --model_dir opencood/logs/opv2v_to_dairv2x_pointpillar_v2xvit_da_baseline_2026_08_12_11_11_38 --fusion_method intermediate --note baseline
+# inference grl
+CUDA_VISIBLE_DEVICES=0 python opencood/tools/inference.py --model_dir opencood/logs/opv2v_to_dairv2x_pointpillar_v2xvit_da_grl_2026_08_13_10_22_54 --fusion_method intermediate --note grl
+#inference dusa
+CUDA_VISIBLE_DEVICES=1 python opencood/tools/inference.py --model_dir opencood/logs/opv2v_to_dairv2x_pointpillar_v2xvit_da_dusa_2026_08_13_10_23_03 --fusion_method intermediate --note dusa
+
+
+CUDA_VISIBLE_DEVICES=0 python opencood/tools/inference.py --model_dir opencood/logs/opv2v_to_dairv2x_pointpillar_v2xvit_da_cudax_2026_08_14_13_14_24 --fusion_method intermediate --note cudax
+CUDA_VISIBLE_DEVICES=1 python opencood/tools/inference.py --model_dir opencood/logs/opv2v_to_dairv2x_pointpillar_v2xvit_da_ssda_2026_08_14_13_14_29 --fusion_method intermediate --note ssda
+
+CUDA_VISIBLE_DEVICES=0 python opencood/tools/inference.py --model_dir opencood/logs/opv2v_to_dairv2x_pointpillar_v2xvit_source_iada_2026_08_18_14_06_26 --fusion_method intermediate --note iada_source
+CUDA_VISIBLE_DEVICES=1 python opencood/tools/inference.py --model_dir opencood/logs/opv2v_to_dairv2x_pointpillar_v2xvit_gate_iada_2026_08_18_13_56_40 --fusion_method intermediate --note iada_gate
+
+
+nohup env CUDA_VISIBLE_DEVICES=0 uv run python \
+  opencood/tools/train_iada.py \
+  --hypes_yaml opencood/hypes_yaml/domain_adaptation/opv2v_to_dair/pointpillar_v2xvit_iada_consistency.yaml \
+  --pretrained_model_dir "$(ls -dt opencood/logs/opv2v_to_dairv2x_pointpillar_v2xvit_da_baseline_* | head -n 1)" \
+  > training_logs/v2xvit_iada_consistency.log 2>&1 &
+
+  nohup env CUDA_VISIBLE_DEVICES=1 uv run python \
+  opencood/tools/train_iada.py \
+  --hypes_yaml opencood/hypes_yaml/domain_adaptation/opv2v_to_dair/pointpillar_v2xvit_iada_full.yaml \
+  --pretrained_model_dir "$(ls -dt opencood/logs/opv2v_to_dairv2x_pointpillar_v2xvit_da_baseline_* | head -n 1)" \
+  > training_logs/v2xvit_iada_full.log 2>&1 &

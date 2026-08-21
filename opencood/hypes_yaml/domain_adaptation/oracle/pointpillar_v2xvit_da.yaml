@@ -1,4 +1,4 @@
-name: opv2v_to_dairv2x_pointpillar_disconet_da
+name: opv2v_to_dairv2x_pointpillar_v2xvit_da
 
 # Target-centric top level: saved checkpoints can be evaluated directly by
 # the existing DAIR-V2X inference entry point.
@@ -10,10 +10,10 @@ test_dir: "/mnt/sdb/caoyitong/v2x_datasets/my_dair_v2x/v2x_c/cooperative-vehicle
 yaml_parser: "load_point_pillar_params"
 
 train_params:
-  batch_size: 4
-  epoches: 20
-  eval_freq: 1
-  save_freq: 1
+  batch_size: 2
+  epoches: 60
+  eval_freq: 2
+  save_freq: 2
   max_cav: 2
 
 noise_setting:
@@ -75,8 +75,6 @@ postprocess:
     anchor_yaw: *anchor_yaw
 
 model:
-  # Student-only DiscoNet uses the common host and ordinary detection loss;
-  # it does not require teacher_processed_lidar or the KD-only model wrapper.
   core_method: point_pillar_baseline
   args:
     voxel_size: *voxel_size
@@ -103,14 +101,48 @@ model:
 
     shrink_header:
       kernal_size: [3]
+      # Preserve the common 100 x 252 comparison grid. V2X-ViT's window
+      # attention has no internal padding, so its windows below must divide
+      # both spatial dimensions exactly.
       stride: [1]
       padding: [1]
       dim: [256]
       input_dim: 384
 
-    fusion_method: disconet
-    disconet:
-      feat_dim: 256
+    fusion_method: v2xvit
+    v2xvit:
+      # Used only when inference input omits prior_encoding. Training always
+      # supplies an explicit prior, so OPV2V's all-zero prior overrides this.
+      prior_encoding_fallback: local_index_1_infra
+      transformer:
+        encoder:
+          num_blocks: 1
+          depth: 3
+          use_roi_mask: true
+          use_RTE: false
+          RTE_ratio: 0
+          cav_att_config:
+            dim: 256
+            use_hetero: true
+            use_RTE: false
+            RTE_ratio: 0
+            heads: 8
+            dim_head: 32
+            dropout: 0.3
+          pwindow_att_config:
+            dim: 256
+            heads: [16, 8, 4]
+            dim_head: [16, 32, 64]
+            dropout: 0.3
+            window_size: [1, 2, 4]
+            relative_pos_embedding: true
+            fusion_method: 'split_attn'
+          feed_forward:
+            mlp_dim: 256
+            dropout: 0.3
+          sttf:
+            voxel_size: *voxel_size
+            downsample_rate: 2
 
     domain_adapter:
       enabled: false
@@ -153,15 +185,15 @@ loss:
 
 optimizer:
   core_method: Adam
-  lr: 0.0002
+  lr: 0.001
   args:
-    eps: 1.0e-10
-    weight_decay: 1.0e-4
+    eps: 1e-10
+    weight_decay: 1e-4
 
 lr_scheduler:
-  core_method: multistep
+  core_method: multistep #step, multistep and Exponential support
   gamma: 0.1
-  step_size: [10, 15]
+  step_size: [15, 50]
 
 domain_adaptation:
   stage: baseline
@@ -174,8 +206,8 @@ domain_adaptation:
     fusion:
       dataset: 'opv2v'
 
-  source_batch_size: 4
-  target_batch_size: 4
+  source_batch_size: 2
+  target_batch_size: 2
   num_workers: 4
   steps_per_epoch: null
   log_freq: 10

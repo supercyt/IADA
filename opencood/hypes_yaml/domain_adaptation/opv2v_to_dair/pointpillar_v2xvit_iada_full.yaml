@@ -1,0 +1,17 @@
+base_config: pointpillar_v2xvit_iada_common.yaml
+
+name: opv2v_to_dairv2x_pointpillar_v2xvit_full_iada
+
+model:
+  args:
+    domain_adapter:
+      iada_source_supervision_enabled: true
+      iada_target_consistency_enabled: true
+      iada_effect_memory_enabled: true
+
+domain_adaptation:
+  iada_safe_weight: 0.1
+  iada_correction_weight: 0.2
+  iada_utility_weight: 0.1
+  iada_consistency_weight: 0.1
+  iada_effect_weight: 0.05

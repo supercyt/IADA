@@ -1,0 +1,7 @@
+base_config: pointpillar_v2xvit_da.yaml
+
+# Shared by the four cumulative IADA ablations. Update this one path after
+# retraining the matching source-only AttFuse baseline.
+domain_adaptation:
+  stage: iada
+  pretrained_model_dir: opencood/logs/opv2v_to_dairv2x_pointpillar_v2xvit_da_baseline_2026_08_12_11_11_38

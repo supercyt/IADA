@@ -1,7 +1,7 @@
-name: opv2v_to_dairv2x_pointpillar_disconet_da
+name: opv2v_to_dairv2x_pointpillar_attfuse_da
 
-# Target-centric top level: saved checkpoints can be evaluated directly by
-# the existing DAIR-V2X inference entry point.
+# Keep the top-level dataset target-centric so the saved config can be used
+# directly by the existing DAIR-V2X inference entry point.
 data_dir: "/mnt/sdb/caoyitong/v2x_datasets/my_dair_v2x/v2x_c/cooperative-vehicle-infrastructure"
 root_dir: "/mnt/sdb/caoyitong/v2x_datasets/my_dair_v2x/v2x_c/cooperative-vehicle-infrastructure/train.json"
 validate_dir: "/mnt/sdb/caoyitong/v2x_datasets/my_dair_v2x/v2x_c/cooperative-vehicle-infrastructure/val.json"
@@ -11,11 +11,13 @@ yaml_parser: "load_point_pillar_params"
 
 train_params:
   batch_size: 4
-  epoches: 20
-  eval_freq: 1
-  save_freq: 1
+  epoches: 25
+  eval_freq: 2
+  save_freq: 2
   max_cav: 2
 
+# The first experiment isolates Sim2Real shift from additional synthetic pose
+# noise. DAIR's system_error_offset in the raw calibration is still retained.
 noise_setting:
   add_noise: true
   args:
@@ -26,6 +28,10 @@ noise_setting:
 
 input_source: ['lidar']
 label_type: 'lidar'
+# Match the official DUSA DAIR-V2X protocol in both training data construction
+# and evaluation. DAIRV2XBaseDataset also defaults this to true for old saved
+# checkpoint configs that predate this explicit key.
+car_only: true
 comm_range: 100
 
 fusion:
@@ -41,8 +47,10 @@ preprocess:
     max_points_per_voxel: 32
     max_voxel_train: 32000
     max_voxel_test: 70000
+  # Shared target-centric geometry for both OPV2V and DAIR-V2X.
   cav_lidar_range: &cav_lidar [-100.8, -40, -3.5, 100.8, 40, 1.5]
 
+# One transform is sampled per scene and shared by every collaborating CAV.
 data_augment:
   - NAME: random_world_flip
     ALONG_AXIS_LIST: ['x']
@@ -75,8 +83,8 @@ postprocess:
     anchor_yaw: *anchor_yaw
 
 model:
-  # Student-only DiscoNet uses the common host and ordinary detection loss;
-  # it does not require teacher_processed_lidar or the KD-only model wrapper.
+  # All comparison methods use the same fusion-agnostic PointPillar host.
+  # --stage only enables/disables the optional domain_adapter below.
   core_method: point_pillar_baseline
   args:
     voxel_size: *voxel_size
@@ -93,6 +101,8 @@ model:
       num_features: 64
 
     base_bev_backbone:
+      # Keep this explicit so source-only and adaptation checkpoints have the
+      # same parameter names and architecture.
       resnet: false
       voxel_size: *voxel_size
       layer_nums: [3, 5, 8]
@@ -101,21 +111,18 @@ model:
       upsample_strides: [1, 2, 4]
       num_upsample_filter: [128, 128, 128]
 
-    shrink_header:
-      kernal_size: [3]
-      stride: [1]
-      padding: [1]
-      dim: [256]
-      input_dim: 384
-
-    fusion_method: disconet
-    disconet:
-      feat_dim: 256
+    fusion_method: att
+    att:
+      feat_dim: 384
 
     domain_adapter:
+      # train_iada.py overwrites enabled/method from --stage. Keeping the YAML
+      # source-only by default prevents accidental target-domain training.
       enabled: false
       method: none
       hidden_dim: 128
+      # The decoded AttFuse map is [H, W] = [100, 252]. DUSA uses a learned
+      # location-selection map and therefore requires this fixed shape.
       feature_size: [100, 252]
       dusa_lsa_hidden_dim: 1024
       dusa_cia_hidden_dim: 512
@@ -126,9 +133,19 @@ model:
       normalize_domain_embedding: true
       cudax_hidden_dim: 256
       ckt_groups: 8
+      # CUDA-X paper leaves the within-slice shuffle grouping unspecified;
+      # this reproduction makes the groups=2 assumption explicit.
       ckt_shuffle_groups: 2
       cudax_bin_count: 5
       cpa_hidden_dim: 1024
+      # Selective Shift (SSDA): FSA is applied to every decoded agent feature
+      # before fusion; SAA aligns ego/global and all-agent/local feature maps.
+      ssda_hidden_dim: 128
+      sao_enabled: true
+      sao_probability: 1.0
+      fsa_epsilon: 0.00001
+      # Keep false for the paper-style joint entropy-guided optimization.
+      ssda_detach_attention: false
 
     dir_args: *dir_args
 
@@ -153,7 +170,7 @@ loss:
 
 optimizer:
   core_method: Adam
-  lr: 0.0002
+  lr: 0.001
   args:
     eps: 1.0e-10
     weight_decay: 1.0e-4
@@ -164,6 +181,7 @@ lr_scheduler:
   step_size: [10, 15]
 
 domain_adaptation:
+  # Can be overridden by train_iada.py --stage.
   stage: baseline
   mode: source_only
   seed: 303
@@ -176,7 +194,7 @@ domain_adaptation:
 
   source_batch_size: 4
   target_batch_size: 4
-  num_workers: 4
+  num_workers: 12
   steps_per_epoch: null
   log_freq: 10
   domain_loss_weight: 0.1
@@ -184,17 +202,33 @@ domain_adaptation:
   dusa_cia_weight: 1.0
   cudax_bin_loss_weight: 0.1
   cudax_domain_loss_weight: 0.1
+  # Equation (18) in Selective Shift uses beta_1=0.5 and beta_2=1.0.
+  ssda_global_weight: 0.5
+  ssda_local_weight: 1.0
   cudax_bin_count: 5
-  # REQUIRED before --stage cudax. Compute these six positive encoded-residual
-  # bounds in [dx, dy, dz, dlog_h, dlog_w, dlog_l] order using only positive
-  # anchors in the OPV2V source training split.
+  # REQUIRED before --stage cudax. Fill six positive bounds in encoded-target
+  # order [dx, dy, dz, dlog_h, dlog_w, dlog_l], computed only from positive
+  # anchors in the OPV2V source training split. The empty list intentionally
+  # fails CUDA-X validation instead of silently using target statistics.
   cudax_residual_bounds: []
+  # The detector is already converged at the baseline checkpoint; preserve it
+  # with a 10x smaller LR while the fresh adapter branch uses the base LR.
   pretrained_lr_scale: 0.1
   adapter_lr_scale: 1.0
+  # Anti-collapse safeguard for the interaction-only branch. The aggregate
+  # RMS-std floor is computed within each domain, so it preserves informative
+  # graph variation without rewarding source/target separation or forcing
+  # every ReLU channel active. A target std of 0.01 matches the freshly
+  # initialized encoder's observed scale; weight 1.0 contributes at most
+  # about 0.01 loss when collapsed and zero once the floor is reached.
   graph_variance_weight: 1.0
   graph_variance_target_std: 0.01
   gradient_clip_norm: 10.0
   grl:
     max_value: 1.0
     gamma: 10.0
+
+  # Optional in-file warm start. The CLI --pretrained_model_dir takes
+  # precedence. Leave empty to train the selected adaptation stage from
+  # scratch; when supplied, it must be this protocol's source-only baseline.
   pretrained_model_dir: ""
