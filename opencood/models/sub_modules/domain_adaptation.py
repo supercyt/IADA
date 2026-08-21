@@ -391,13 +391,12 @@ class DUSAAdapter(FusionAgnosticDomainAdapter):
 
 
 class IADAAdapter(FusionAgnosticDomainAdapter):
-    """Interventional advantage adaptation for collaborative perception.
+    """Conditional adversarial alignment of collaboration-induced effects.
 
     IADA treats the ego-only feature as a counterfactual control and learns a
     bounded, identity-initialized modulation of the innovation introduced by
-    collaboration.  The adapter deliberately avoids a domain discriminator:
-    source supervision and target consistency are applied to the *change* in
-    predictions between ego-only and collaborative inference.
+    collaboration.  Global and mode/range-conditional domain discriminators
+    align the *effect* of collaboration rather than raw sensor features.
     """
 
     method = "iada"
@@ -409,7 +408,9 @@ class IADAAdapter(FusionAgnosticDomainAdapter):
         hidden_dim: int = 64,
         effect_dim: int = 64,
         geometry_scale: float = 100.0,
-        gate_limit: float = 1.0,
+        gate_limit: float = 0.25,
+        domain_hidden_dim: int = 64,
+        local_topk: int = 256,
         source_supervision_enabled: bool = True,
         target_consistency_enabled: bool = True,
         effect_memory_enabled: bool = True,
@@ -420,9 +421,14 @@ class IADAAdapter(FusionAgnosticDomainAdapter):
         super().__init__()
         if in_channels <= 0 or anchor_number <= 0:
             raise ValueError("IADA channel and anchor counts must be positive")
-        if hidden_dim <= 0 or effect_dim <= 0 or geometry_scale <= 0:
+        if (
+            hidden_dim <= 0
+            or effect_dim <= 0
+            or domain_hidden_dim <= 0
+            or geometry_scale <= 0
+        ):
             raise ValueError("IADA hidden/effect dimensions and scale are invalid")
-        if gate_limit < 0 or not 0 <= consistency_dropout < 1:
+        if gate_limit < 0 or local_topk <= 0 or not 0 <= consistency_dropout < 1:
             raise ValueError("IADA gate limit/dropout is invalid")
         if not 0 <= teacher_momentum < 1 or not 0 <= prototype_momentum < 1:
             raise ValueError("IADA EMA momenta must be in [0, 1)")
@@ -431,6 +437,7 @@ class IADAAdapter(FusionAgnosticDomainAdapter):
         self.anchor_number = int(anchor_number)
         self.geometry_scale = float(geometry_scale)
         self.gate_limit = float(gate_limit)
+        self.local_topk = int(local_topk)
         self.source_supervision_enabled = bool(source_supervision_enabled)
         self.target_consistency_enabled = bool(target_consistency_enabled)
         self.effect_memory_enabled = bool(effect_memory_enabled)
@@ -463,6 +470,18 @@ class IADAAdapter(FusionAgnosticDomainAdapter):
         )
         self.utility_head = nn.Conv2d(
             effect_dim, anchor_number, kernel_size=1
+        )
+        self.effect_gradient_reversal = GradientReversal()
+        self.global_effect_discriminator = nn.Sequential(
+            nn.Linear(effect_dim, domain_hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(domain_hidden_dim, 1),
+        )
+        # Three collaboration-effect modes by three geometry ranges.
+        self.local_effect_discriminator = nn.Sequential(
+            nn.Conv2d(effect_dim, domain_hidden_dim, kernel_size=1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(domain_hidden_dim, 9, kernel_size=1),
         )
 
         self.teacher_innovation_encoder = copy.deepcopy(
@@ -613,7 +632,9 @@ class IADAAdapter(FusionAgnosticDomainAdapter):
                 (gate - 1.0).abs()
                 >= max(0.95 * self.gate_limit, 1.0e-6)
             ).to(gate.dtype).mean().reshape(1),
+            "iada_gate_identity_loss": (gate - 1.0).square().mean().reshape(1),
             "iada_range_index": range_index,
+            "iada_valid_scene_mask": record_len > 1,
         }
 
         if (
@@ -661,21 +682,76 @@ class IADAAdapter(FusionAgnosticDomainAdapter):
             fused_features,
             record_len,
             pairwise_t_matrix,
-            grl_lambda,
             agent_confidence_logits,
-            fused_class_logits,
             detection_features,
             adapter_domain,
         )
         if context is None or "iada_effect_features" not in context:
             raise ValueError("IADA adapt_fused must run before its heads")
+        if fused_class_logits is None or "iada_ego_cls_preds" not in context:
+            raise ValueError(
+                "IADA effect alignment requires fused and ego class logits"
+            )
+
+        effect = context["iada_effect_features"]
+        fused_probability = fused_class_logits.detach().sigmoid().amax(
+            dim=1, keepdim=True
+        )
+        ego_probability = context["iada_ego_cls_preds"].detach().sigmoid().amax(
+            dim=1, keepdim=True
+        )
+        union_probability = (
+            fused_probability + ego_probability
+            - fused_probability * ego_probability
+        )
+        batch_size, _, height, width = union_probability.shape
+        flat_union = union_probability.reshape(batch_size, -1)
+        topk = min(self.local_topk, flat_union.shape[1])
+        topk_indices = flat_union.topk(topk, dim=1).indices
+        topk_mask = torch.zeros_like(flat_union)
+        topk_mask.scatter_(1, topk_indices, 1.0)
+        topk_mask = topk_mask.reshape(batch_size, 1, height, width)
+
+        discovery = (1.0 - ego_probability) * fused_probability
+        suppression = ego_probability * (1.0 - fused_probability)
+        refinement = ego_probability * fused_probability
+        mode_weights = torch.cat(
+            (discovery, suppression, refinement), dim=1
+        ) * topk_mask
+        range_one_hot = F.one_hot(
+            context["iada_range_index"].long(), num_classes=3
+        ).to(effect.dtype)
+        conditional_weights = (
+            range_one_hot[:, :, None, None, None]
+            * mode_weights[:, None, :, :, :]
+        ).reshape(batch_size, 9, height, width)
+
+        attention = union_probability * topk_mask
+        attention_sum = attention.sum(dim=(-2, -1)).clamp_min(1.0e-6)
+        global_effect = (effect * attention).sum(dim=(-2, -1)) / attention_sum
+        reversed_effect = self.effect_gradient_reversal(
+            effect, coefficient=grl_lambda
+        )
+        reversed_global = self.effect_gradient_reversal(
+            global_effect, coefficient=grl_lambda
+        )
+        valid_scene = context.get(
+            "iada_valid_scene_mask",
+            torch.ones(batch_size, device=effect.device, dtype=torch.bool),
+        )
+        conditional_weights = conditional_weights * valid_scene[
+            :, None, None, None
+        ].to(conditional_weights.dtype)
+
         output_keys = (
             "iada_effect_features",
             "iada_utility_logits",
             "iada_gate_mean",
             "iada_gate_deviation",
             "iada_gate_saturation",
+            "iada_gate_identity_loss",
             "iada_range_index",
+            "iada_valid_scene_mask",
             "iada_ego_cls_preds",
             "iada_ego_reg_preds",
             "iada_consistency_cls_preds",
@@ -684,6 +760,19 @@ class IADAAdapter(FusionAgnosticDomainAdapter):
             "iada_teacher_reg_preds",
         )
         output = {key: context[key] for key in output_keys if key in context}
+        output.update(
+            iada_global_domain_logits=self.global_effect_discriminator(
+                reversed_global
+            ),
+            iada_global_domain_valid=valid_scene,
+            iada_local_domain_logits=self.local_effect_discriminator(
+                reversed_effect
+            ),
+            iada_local_domain_weights=conditional_weights.detach(),
+            iada_local_active_fraction=(
+                conditional_weights.sum(dim=1) > 0
+            ).to(effect.dtype).mean().reshape(1),
+        )
         if self.effect_memory_enabled:
             output["iada_effect_prototypes"] = self.effect_prototypes
             output["iada_effect_counts"] = self.effect_counts
@@ -1415,15 +1504,19 @@ def build_domain_adapter(
             hidden_dim=int(config.get("iada_hidden_dim", 64)),
             effect_dim=int(config.get("iada_effect_dim", 64)),
             geometry_scale=float(config.get("geometry_scale", 100.0)),
-            gate_limit=float(config.get("iada_gate_limit", 1.0)),
+            gate_limit=float(config.get("iada_gate_limit", 0.25)),
+            domain_hidden_dim=int(
+                config.get("iada_domain_hidden_dim", 64)
+            ),
+            local_topk=int(config.get("iada_local_topk", 256)),
             source_supervision_enabled=bool(
                 config.get("iada_source_supervision_enabled", True)
             ),
             target_consistency_enabled=bool(
-                config.get("iada_target_consistency_enabled", True)
+                config.get("iada_target_consistency_enabled", False)
             ),
             effect_memory_enabled=bool(
-                config.get("iada_effect_memory_enabled", True)
+                config.get("iada_effect_memory_enabled", False)
             ),
             consistency_dropout=float(
                 config.get("iada_consistency_dropout", 0.1)

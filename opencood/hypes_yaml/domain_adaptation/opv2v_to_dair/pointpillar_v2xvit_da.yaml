@@ -158,10 +158,12 @@ model:
       normalize_domain_embedding: true
       iada_hidden_dim: 64
       iada_effect_dim: 64
-      iada_gate_limit: 1.0
+      iada_gate_limit: 0.25
+      iada_domain_hidden_dim: 64
+      iada_local_topk: 256
       iada_source_supervision_enabled: true
-      iada_target_consistency_enabled: true
-      iada_effect_memory_enabled: true
+      iada_target_consistency_enabled: false
+      iada_effect_memory_enabled: false
       iada_consistency_dropout: 0.1
       iada_teacher_momentum: 0.999
       iada_prototype_momentum: 0.99
@@ -225,11 +227,16 @@ domain_adaptation:
   dusa_cia_weight: 1.0
   cudax_bin_loss_weight: 0.1
   cudax_domain_loss_weight: 0.1
-  iada_safe_weight: 0.1
-  iada_correction_weight: 0.2
-  iada_utility_weight: 0.1
-  iada_consistency_weight: 0.1
-  iada_effect_weight: 0.05
+  iada_safe_weight: 0.05
+  iada_correction_weight: 0.0
+  iada_utility_weight: 0.0
+  iada_consistency_weight: 0.0
+  iada_effect_weight: 0.0
+  iada_global_domain_weight: 0.05
+  iada_local_domain_weight: 0.05
+  iada_gate_identity_weight: 0.1
+  iada_effect_variance_weight: 0.01
+  iada_effect_target_std: 0.05
   iada_source_adapter_only: true
   iada_target_adapter_only: true
   iada_safe_margin: 0.0

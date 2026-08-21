@@ -523,6 +523,11 @@ def _configure_stage(hypes, requested_stage):
         "iada_utility_weight",
         "iada_consistency_weight",
         "iada_effect_weight",
+        "iada_global_domain_weight",
+        "iada_local_domain_weight",
+        "iada_gate_identity_weight",
+        "iada_effect_variance_weight",
+        "iada_effect_target_std",
         "ssda_global_weight",
         "ssda_local_weight",
     )
@@ -666,6 +671,8 @@ def _combine_domain_metrics(source_metrics, target_metrics):
             or key.endswith("_mean")
             or key.endswith("_deviation")
             or key.endswith("_saturation")
+            or key.endswith("_fraction")
+            or key.endswith("_std")
         ):
             combined[key] = torch.stack(tensor_values).nanmean()
         elif key == "graph_variance_update_applied":
@@ -1406,6 +1413,12 @@ def main():
                         ("iada_utility_loss", "util"),
                         ("iada_consistency_loss", "cons"),
                         ("iada_effect_loss", "effect"),
+                        ("iada_global_domain_loss", "dom_global"),
+                        ("iada_local_domain_loss", "dom_local"),
+                        ("iada_local_domain_accuracy", "local_acc"),
+                        ("iada_gate_identity_loss", "identity"),
+                        ("iada_effect_std", "effect_std"),
+                        ("iada_local_active_fraction", "active"),
                         ("iada_target_selected_fraction", "selected"),
                         ("iada_gate_deviation", "gate_dev"),
                         ("iada_gate_saturation", "gate_sat"),

@@ -10,8 +10,12 @@ model:
       iada_effect_memory_enabled: false
 
 domain_adaptation:
-  iada_safe_weight: 0.1
-  iada_correction_weight: 0.2
-  iada_utility_weight: 0.1
+  iada_safe_weight: 0.05
+  iada_correction_weight: 0.0
+  iada_utility_weight: 0.0
   iada_consistency_weight: 0.0
   iada_effect_weight: 0.0
+  iada_global_domain_weight: 0.0
+  iada_local_domain_weight: 0.0
+  iada_gate_identity_weight: 0.1
+  iada_effect_variance_weight: 0.0

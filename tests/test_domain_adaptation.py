@@ -392,6 +392,68 @@ class AdapterForwardTest(unittest.TestCase):
         self.assertEqual(context["iada_range_index"].shape, (2,))
         self.assertEqual(context["iada_gate_mean"].item(), 1.0)
 
+    def test_iada_effect_domain_heads_restore_accuracy_and_gradients(self):
+        agent_features, fused_features, record_len, pairwise = (
+            _adapter_inputs()
+        )
+        adapter = IADAAdapter(
+            in_channels=4,
+            anchor_number=2,
+            hidden_dim=4,
+            effect_dim=6,
+            domain_hidden_dim=5,
+            local_topk=2,
+            target_consistency_enabled=False,
+            effect_memory_enabled=False,
+        ).train()
+        calibrated, context = adapter.adapt_fused(
+            agent_features,
+            fused_features,
+            record_len,
+            grl_lambda=0.5,
+            pairwise_t_matrix=pairwise,
+            adapter_domain="target",
+        )
+        fused_logits = torch.randn(2, 2, 2, 2)
+        context["iada_ego_cls_preds"] = torch.randn(2, 2, 2, 2)
+        context["iada_ego_reg_preds"] = torch.zeros(2, 14, 2, 2)
+        output = adapter(
+            agent_features,
+            calibrated,
+            record_len,
+            pairwise,
+            grl_lambda=0.5,
+            fused_class_logits=fused_logits,
+            context=context,
+        )
+        output["cls_preds"] = fused_logits
+        output["reg_preds"] = torch.zeros(2, 14, 2, 2)
+
+        self.assertEqual(output["iada_global_domain_logits"].shape, (2, 1))
+        self.assertEqual(output["iada_local_domain_logits"].shape, (2, 9, 2, 2))
+        self.assertEqual(output["iada_local_domain_weights"].shape, (2, 9, 2, 2))
+        loss, metrics = compute_single_domain_adaptation_loss(
+            "iada",
+            "target",
+            output,
+            record_len,
+            None,
+            {
+                "iada_global_domain_weight": 1.0,
+                "iada_local_domain_weight": 1.0,
+                "iada_gate_identity_weight": 0.0,
+                "iada_effect_variance_weight": 0.0,
+            },
+            iada_domain_enabled=True,
+        )
+        self.assertTrue(torch.isfinite(metrics["domain_accuracy"]))
+        self.assertGreater(metrics["iada_local_valid_count"].item(), 0)
+        loss.backward()
+        self.assertIsNotNone(
+            adapter.global_effect_discriminator[0].weight.grad
+        )
+        self.assertIsNotNone(adapter.innovation_encoder[0].weight.grad)
+
     def test_iada_target_builds_intervention_and_teacher_views(self):
         agent_features, fused_features, record_len, pairwise = (
             _adapter_inputs()
@@ -1369,6 +1431,9 @@ class PointPillarBaselineAdapterTest(unittest.TestCase):
                 "iada_effect_features",
                 "iada_ego_cls_preds",
                 "iada_ego_reg_preds",
+                "iada_global_domain_logits",
+                "iada_local_domain_logits",
+                "iada_local_domain_weights",
             },
             "cudax": {
                 "ckt_domain_logits",

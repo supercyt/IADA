@@ -348,6 +348,141 @@ def single_domain_graph_variance_loss(
     return 0.5 * F.relu(target_std - standard_deviation)
 
 
+def single_domain_conditioned_loss(
+    domain_logits: torch.Tensor,
+    condition_weights: torch.Tensor,
+    domain_label: float,
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """Normalize every active IADA condition independently.
+
+    Normalizing by the sum of soft weights is important here: averaging over
+    the entire BEV map would make the adversarial signal vanish as object
+    evidence becomes sparse.
+    """
+
+    if domain_label not in (0.0, 1.0):
+        raise ValueError("domain_label must be either 0 or 1")
+    if domain_logits.shape != condition_weights.shape:
+        raise ValueError("IADA local logits and condition weights must match")
+    if domain_logits.ndim != 4:
+        raise ValueError("IADA local domain tensors must have shape [B,K,H,W]")
+    weights = condition_weights.to(
+        device=domain_logits.device, dtype=domain_logits.dtype
+    )
+    if bool((weights < 0).any().item()):
+        raise ValueError("IADA condition weights must be non-negative")
+
+    labels = torch.full_like(domain_logits, float(domain_label))
+    element_loss = F.binary_cross_entropy_with_logits(
+        domain_logits, labels, reduction="none"
+    )
+    correct = ((domain_logits >= 0) == (labels > 0.5)).to(weights.dtype)
+    losses = []
+    accuracies = []
+    for condition in range(domain_logits.shape[1]):
+        selected_weights = weights[:, condition]
+        denominator = selected_weights.sum()
+        if float(denominator.detach().item()) <= 1.0e-8:
+            continue
+        losses.append(
+            (element_loss[:, condition] * selected_weights).sum()
+            / denominator
+        )
+        accuracies.append(
+            (correct[:, condition] * selected_weights).sum() / denominator
+        )
+    if not losses:
+        zero = domain_logits.sum() * 0.0
+        return zero, domain_logits.new_tensor(float("nan")), 0
+    return (
+        torch.stack(losses).mean(),
+        torch.stack(accuracies).mean(),
+        int((weights > 0).sum().item()),
+    )
+
+
+def iada_effect_domain_loss(
+    output_dict: Mapping[str, torch.Tensor],
+    domain_label: float,
+    config: Mapping[str, object],
+    *,
+    enabled: bool,
+    variance_enabled: bool,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """One domain's balanced conditional collaboration-effect objective."""
+
+    global_logits = output_dict["iada_global_domain_logits"]
+    local_logits = output_dict["iada_local_domain_logits"]
+    valid = output_dict["iada_global_domain_valid"]
+    if enabled:
+        global_loss, global_accuracy, global_count = single_domain_loss(
+            global_logits, domain_label, valid_mask=valid
+        )
+        local_loss, local_accuracy, local_count = (
+            single_domain_conditioned_loss(
+                local_logits,
+                output_dict["iada_local_domain_weights"],
+                domain_label,
+            )
+        )
+    else:
+        global_loss = global_logits.sum() * 0.0
+        local_loss = local_logits.sum() * 0.0
+        global_accuracy = global_logits.new_tensor(float("nan"))
+        local_accuracy = local_logits.new_tensor(float("nan"))
+        global_count = local_count = 0
+
+    half_global = 0.5 * global_loss
+    half_local = 0.5 * local_loss
+    identity = output_dict.get(
+        "iada_gate_identity_loss", global_logits.new_zeros(())
+    ).mean()
+    half_identity = 0.5 * identity
+
+    effect = output_dict["iada_effect_features"]
+    selected_effect = effect[valid.to(device=effect.device, dtype=torch.bool)]
+    target_std = float(config.get("iada_effect_target_std", 0.05))
+    if variance_enabled and target_std > 0 and selected_effect.shape[0] >= 2:
+        samples = selected_effect.permute(0, 2, 3, 1).reshape(
+            -1, selected_effect.shape[1]
+        )
+        effect_std = torch.sqrt(
+            samples.var(dim=0, unbiased=False).mean() + 1.0e-8
+        )
+        half_variance = 0.5 * F.relu(target_std - effect_std)
+    else:
+        effect_std = effect.new_zeros(())
+        half_variance = effect.sum() * 0.0
+
+    total = (
+        float(config.get("iada_global_domain_weight", 0.05)) * half_global
+        + float(config.get("iada_local_domain_weight", 0.05)) * half_local
+        + float(config.get("iada_gate_identity_weight", 0.1)) * half_identity
+        + float(config.get("iada_effect_variance_weight", 0.01))
+        * half_variance
+    )
+    domain_accuracy = torch.stack(
+        (global_accuracy, local_accuracy)
+    ).nanmean()
+    metrics = {
+        "domain_loss": half_global + half_local,
+        "domain_accuracy": domain_accuracy,
+        "iada_global_domain_loss": half_global,
+        "iada_global_domain_accuracy": global_accuracy,
+        "iada_global_valid_count": global_logits.new_tensor(global_count),
+        "iada_local_domain_loss": half_local,
+        "iada_local_domain_accuracy": local_accuracy,
+        "iada_local_valid_count": global_logits.new_tensor(local_count),
+        "iada_gate_identity_loss": half_identity,
+        "iada_effect_variance_loss": half_variance,
+        "iada_effect_std": effect_std,
+        "iada_local_active_fraction": output_dict.get(
+            "iada_local_active_fraction", global_logits.new_zeros(())
+        ).mean(),
+    }
+    return total, metrics
+
+
 def dusa_agent_loss(
     agent_logits: torch.Tensor,
     confidence_weights: torch.Tensor,
@@ -974,21 +1109,79 @@ def compute_adaptation_loss(
 
     if method == "iada":
         total_scenes = int(domain_labels.numel())
-        source_output = {}
-        for key, value in output_dict.items():
-            if (
-                torch.is_tensor(value)
-                and value.ndim > 0
-                and value.shape[0] == total_scenes
-                and key
-                not in ("iada_effect_prototypes", "iada_effect_counts")
-            ):
-                source_output[key] = value[:source_scene_count]
-            else:
-                source_output[key] = value
-        return iada_source_adaptation_loss(
-            source_output, source_label_dict, config
+        if source_scene_count <= 0 or source_scene_count > total_scenes:
+            raise ValueError("IADA source scene count is invalid")
+        if source_scene_count == total_scenes:
+            return iada_source_adaptation_loss(
+                output_dict, source_label_dict, config
+            )
+
+        def slice_scenes(start: int, end: int):
+            sliced = {}
+            for key, value in output_dict.items():
+                if (
+                    torch.is_tensor(value)
+                    and value.ndim > 0
+                    and value.shape[0] == total_scenes
+                    and key
+                    not in ("iada_effect_prototypes", "iada_effect_counts")
+                ):
+                    sliced[key] = value[start:end]
+                else:
+                    sliced[key] = value
+            return sliced
+
+        source_record_len = record_len[:source_scene_count]
+        target_record_len = record_len[source_scene_count:]
+        domain_enabled = bool((source_record_len > 1).any().item()) and bool(
+            (target_record_len > 1).any().item()
         )
+        target_std = float(config.get("iada_effect_target_std", 0.05))
+        variance_enabled = (
+            target_std > 0
+            and int((source_record_len > 1).sum().item()) >= 2
+            and int((target_record_len > 1).sum().item()) >= 2
+        )
+        source_loss, source_metrics = compute_single_domain_adaptation_loss(
+            "iada",
+            "source",
+            slice_scenes(0, source_scene_count),
+            source_record_len,
+            source_label_dict,
+            config,
+            iada_domain_enabled=domain_enabled,
+            iada_variance_enabled=variance_enabled,
+        )
+        target_loss, target_metrics = compute_single_domain_adaptation_loss(
+            "iada",
+            "target",
+            slice_scenes(source_scene_count, total_scenes),
+            target_record_len,
+            None,
+            config,
+            iada_domain_enabled=domain_enabled,
+            iada_variance_enabled=variance_enabled,
+        )
+        for key in source_metrics.keys() | target_metrics.keys():
+            values = [
+                item[key]
+                for item in (source_metrics, target_metrics)
+                if key in item
+            ]
+            if key.endswith(
+                (
+                    "accuracy",
+                    "_mean",
+                    "_deviation",
+                    "_saturation",
+                    "_fraction",
+                    "_std",
+                )
+            ):
+                metrics[key] = torch.stack(values).nanmean()
+            else:
+                metrics[key] = torch.stack(values).sum()
+        return source_loss + target_loss, metrics
 
     if method == "ssda":
         global_loss, global_accuracy, global_count = (
@@ -1160,14 +1353,27 @@ def compute_single_domain_adaptation_loss(
         )
 
     if method == "iada":
-        del iada_domain_enabled, iada_variance_enabled
         if domain == "source":
             if source_label_dict is None:
                 raise ValueError("IADA source loss requires source labels")
-            return iada_source_adaptation_loss(
+            auxiliary_loss, auxiliary_metrics = iada_source_adaptation_loss(
                 output_dict, source_label_dict, config
             )
-        return iada_target_adaptation_loss(output_dict, config)
+        else:
+            auxiliary_loss, auxiliary_metrics = iada_target_adaptation_loss(
+                output_dict, config
+            )
+        adversarial_loss, adversarial_metrics = iada_effect_domain_loss(
+            output_dict,
+            domain_label,
+            config,
+            enabled=iada_domain_enabled,
+            variance_enabled=iada_variance_enabled,
+        )
+        metrics.update(auxiliary_metrics)
+        metrics.update(adversarial_metrics)
+        metrics["iada_aux_loss"] = auxiliary_loss
+        return auxiliary_loss + adversarial_loss, metrics
 
     if method == "ssda":
         global_loss, global_accuracy, global_count = (
@@ -1219,9 +1425,11 @@ __all__ = [
     "dusa_agent_loss",
     "entropy_weighted_domain_loss",
     "graph_variance_floor_loss",
+    "iada_effect_domain_loss",
     "iada_source_adaptation_loss",
     "iada_target_adaptation_loss",
     "single_domain_entropy_weighted_loss",
+    "single_domain_conditioned_loss",
     "single_domain_graph_variance_loss",
     "single_domain_loss",
 ]
