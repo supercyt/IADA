@@ -2,6 +2,25 @@ base_config: pointpillar_attfuse_iada.yaml
 
 # Shared by the four cumulative IADA ablations. Update this one path after
 # retraining the matching source-only AttFuse baseline.
+model:
+  args:
+    domain_adapter:
+      # AttFuse's 100x252 BEV makes topk=256 too sparse (~1%).
+      iada_local_topk: 512
+
+train_params:
+  # Save and report target AP at every epoch for directly comparable curves.
+  epoches: 15
+  eval_freq: 1
+  save_freq: 1
+
 domain_adaptation:
   stage: iada
   pretrained_model_dir: opencood/logs/opv2v_to_dairv2x_pointpillar_attfuse_da_baseline_2026_08_12_11_19_29
+  pretrained_lr_scale: 0.05
+  adapter_lr_scale: 0.5
+  iada_gate_identity_weight: 0.1
+  iada_effect_variance_weight: 0.0
+  grl:
+    max_value: 0.5
+    gamma: 5.0

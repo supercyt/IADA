@@ -1,8 +1,9 @@
 name: zut_opv2v_point_pillar_selfatt
 root_dir: "/home/caoyitong/DataProjects/v2x_datasets/ZUT_OPV2V/train"
 validate_dir: "/home/caoyitong/DataProjects/v2x_datasets/ZUT_OPV2V/validate"
-# train.py automatically evaluates this labeled mirror after training.
-test_dir: "/home/caoyitong/DataProjects/v2x_datasets/ZUT_OPV2V/test_labeled"
+# Test is a hard-linked evaluation view of validate until a separately
+# collected held-out test set is added.
+test_dir: "/home/caoyitong/DataProjects/v2x_datasets/ZUT_OPV2V/test"
 
 noise_setting:
   add_noise: false
@@ -20,8 +21,15 @@ train_params:
   save_freq: 2
   max_cav: &max_cav 2
 
-# ZUT inference and annotation use the front acquisition vehicle as ego.
-fixed_ego_id: '0'
+# Randomize ego only when the selected view retains a non-self target. This
+# preserves the rear-observes-front supervision instead of turning it into a
+# large number of accidental negative samples. Evaluation is deterministic.
+ego_selection:
+  train: label_aware_random
+  eval: '1'
+remove_ego_object:
+  center: [-2.38991334, 0.25333039, 0.73471033]
+  tolerance: 1.0
 
 input_source: ['lidar']
 label_type: 'lidar'
@@ -52,10 +60,10 @@ postprocess:
   gt_range: *cav_lidar
   anchor_args:
     cav_lidar_range: *cav_lidar
-    # Median canonical Car dimensions in experiment_1_resynced.
+    # Median canonical Car dimensions across the retained experiment 1+2 boxes.
     l: 4.32
-    w: 2.02
-    h: 1.77
+    w: 1.98
+    h: 1.86
     r: &anchor_yaw [0, 90]
     feature_stride: 2
     num: &anchor_num 2

@@ -86,6 +86,62 @@ def getIntermediateFusionDataset(cls):
                 self.stage1_result_path = params['box_align']['train_result'] if train else params['box_align']['val_result']
                 self.stage1_result = read_json(self.stage1_result_path)
                 self.box_align_args = params['box_align']['args']
+
+        def select_ego(self, base_data_dict):
+            """Apply an optional label-aware ego policy for asymmetric data."""
+            ego_config = self.params.get('ego_selection', {})
+            policy = ego_config.get('train') if self.train else ego_config.get('eval')
+            if not policy:
+                return base_data_dict
+
+            cav_ids = list(base_data_dict.keys())
+            if self.train and policy == 'label_aware_random':
+                remove_config = self.params.get('remove_ego_object')
+                if not remove_config:
+                    raise ValueError(
+                        'label_aware_random requires remove_ego_object'
+                    )
+                ego_center = np.asarray(
+                    remove_config['center'], dtype=np.float64
+                )
+                tolerance = float(remove_config['tolerance'])
+                valid_cavs = []
+                for candidate_id in cav_ids:
+                    reference_pose = base_data_dict[candidate_id][
+                        'params']['lidar_pose_clean']
+                    object_rows = []
+                    object_ids = []
+                    for cav_content in base_data_dict.values():
+                        centers, mask, ids = self.generate_object_center(
+                            [cav_content], reference_pose
+                        )
+                        count = int(mask.sum())
+                        object_rows.extend(centers[:count])
+                        object_ids.extend(ids)
+                    if not object_rows:
+                        continue
+                    unique = [object_ids.index(value)
+                              for value in dict.fromkeys(object_ids)]
+                    centers = np.asarray(object_rows)[unique]
+                    non_ego = np.linalg.norm(
+                        centers[:, :3] - ego_center[None, :], axis=1
+                    ) >= tolerance
+                    if np.any(non_ego):
+                        valid_cavs.append(candidate_id)
+                chosen_id = random.choice(valid_cavs or cav_ids)
+            else:
+                chosen_id = str(policy)
+                if chosen_id not in base_data_dict:
+                    raise ValueError(
+                        f'eval ego {chosen_id!r} is absent from sample'
+                    )
+
+            ordered = OrderedDict()
+            for cav_id in [chosen_id] + [x for x in cav_ids if x != chosen_id]:
+                content = base_data_dict[cav_id]
+                content['ego'] = cav_id == chosen_id
+                ordered[cav_id] = content
+            return ordered
                 
 
 
@@ -317,6 +373,7 @@ def getIntermediateFusionDataset(cls):
 
         def __getitem__(self, idx):
             base_data_dict = self.retrieve_base_data(idx)
+            base_data_dict = self.select_ego(base_data_dict)
             base_data_dict = add_noise_data_dict(base_data_dict,self.params['noise_setting'])
             scene_augmentation = sample_scene_augmentation(
                 self.params.get('data_augment', []), self.train
@@ -477,6 +534,27 @@ def getIntermediateFusionDataset(cls):
                 [object_id_stack.index(x) for x in set(object_id_stack)]
             object_stack = np.vstack(object_stack)
             object_stack = object_stack[unique_indices]
+
+            # Some real-world cooperative labels contain each connected
+            # vehicle in the *other* CAV's annotation.  After multi-CAV label
+            # merging that can reintroduce the currently selected ego as a
+            # detection target.  Remove it geometrically when explicitly
+            # configured, so the rule remains correct when training randomly
+            # chooses either CAV as ego and leaves existing datasets unchanged.
+            remove_ego_config = self.params.get('remove_ego_object')
+            if remove_ego_config:
+                ego_center = np.asarray(
+                    remove_ego_config['center'], dtype=np.float64
+                )
+                tolerance = float(remove_ego_config['tolerance'])
+                keep_object = np.linalg.norm(
+                    object_stack[:, :3] - ego_center[None, :], axis=1
+                ) >= tolerance
+                object_stack = object_stack[keep_object]
+                unique_indices = [
+                    index for index, keep in zip(unique_indices, keep_object)
+                    if keep
+                ]
 
             # make sure bounding boxes across all frames have the same number
             object_bbx_center = \
@@ -719,4 +797,3 @@ def getIntermediateFusionDataset(cls):
 
 
     return IntermediateFusionDataset
-

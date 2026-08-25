@@ -506,6 +506,47 @@ class ValidationTest(unittest.TestCase):
             model_inputs["prior_encoding"], expected_prior
         )
 
+    def test_target_validation_can_report_detection_average_precision(self):
+        model = unittest.mock.Mock(
+            return_value={
+                "cls_preds": torch.tensor([[[[1.0]]]]),
+                "reg_preds": torch.tensor([[[[2.0]]]]),
+            }
+        )
+        criterion = unittest.mock.Mock(return_value=torch.tensor(3.0))
+        ego_batch = {
+            "processed_lidar": {},
+            "record_len": torch.tensor([2]),
+            "pairwise_t_matrix": torch.eye(4).reshape(1, 1, 1, 4, 4).repeat(
+                1, 2, 2, 1, 1
+            ),
+            "lidar_pose": torch.zeros(2, 6),
+            "label_dict": {},
+        }
+
+        class Dataset:
+            @staticmethod
+            def post_process(_batch_data, _output_dict):
+                box = torch.tensor(
+                    [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]]
+                )
+                return box, torch.ones(1), box.clone()
+
+        class Loader(list):
+            dataset = Dataset()
+
+        loss, average_precision = _validate_detection(
+            model,
+            criterion,
+            Loader([{"ego": ego_batch}]),
+            torch.device("cpu"),
+            domain="target",
+            calculate_ap=True,
+        )
+
+        self.assertEqual(loss, 3.0)
+        self.assertEqual(average_precision, {0.3: 1.0, 0.5: 1.0, 0.7: 1.0})
+
     def test_validation_rejects_unknown_domain(self):
         with self.assertRaisesRegex(ValueError, "validation domain"):
             _validate_detection(

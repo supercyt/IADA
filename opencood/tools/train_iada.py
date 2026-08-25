@@ -549,12 +549,17 @@ def _make_loader(
     shuffle,
     drop_last,
     pin_memory,
+    evaluation=False,
 ):
     loader_args = {
         "dataset": dataset,
         "batch_size": batch_size,
         "num_workers": num_workers,
-        "collate_fn": dataset.collate_batch_train,
+        "collate_fn": (
+            dataset.collate_batch_test
+            if evaluation
+            else dataset.collate_batch_train
+        ),
         "shuffle": shuffle,
         "pin_memory": pin_memory,
         "drop_last": drop_last,
@@ -872,17 +877,34 @@ def _setup_stage_optimizer(hypes, model, stage):
 
 
 @torch.no_grad()
-def _validate_detection(model, criterion, data_loader, device, domain):
+def _validate_detection(
+    model,
+    criterion,
+    data_loader,
+    device,
+    domain,
+    calculate_ap=False,
+):
     if domain not in ("source", "target"):
         raise ValueError("validation domain must be 'source' or 'target'")
 
     model.eval()
     validation_losses = []
+    result_stat = None
+    if calculate_ap:
+        result_stat = {
+            threshold: {"tp": [], "fp": [], "gt": 0, "score": []}
+            for threshold in (0.3, 0.5, 0.7)
+        }
 
     for batch_data in data_loader:
         if batch_data is None:
             continue
-        ego_batch = batch_data["ego"]
+        if calculate_ap:
+            batch_data = train_utils.to_device(batch_data, device)
+            ego_batch = batch_data["ego"]
+        else:
+            ego_batch = batch_data["ego"]
         model_inputs = train_utils.to_device(
             _select_model_inputs(ego_batch, domain), device
         )
@@ -896,11 +918,36 @@ def _validate_detection(model, criterion, data_loader, device, domain):
         validation_loss = criterion(detection_output, label_dict)
         validation_losses.append(float(validation_loss.item()))
 
+        if calculate_ap:
+            from opencood.utils import eval_utils
+
+            pred_box, pred_score, gt_box = data_loader.dataset.post_process(
+                batch_data, {"ego": output_dict}
+            )
+            for threshold in result_stat:
+                eval_utils.caluclate_tp_fp(
+                    pred_box,
+                    pred_score,
+                    gt_box,
+                    result_stat,
+                    threshold,
+                )
+
     if not validation_losses:
         raise RuntimeError(
             f"{domain.capitalize()} validation loader produced no valid batch"
         )
-    return statistics.mean(validation_losses)
+    mean_loss = statistics.mean(validation_losses)
+    if not calculate_ap:
+        return mean_loss
+
+    from opencood.utils import eval_utils
+
+    average_precision = {
+        threshold: eval_utils.calculate_ap(result_stat, threshold)[0]
+        for threshold in result_stat
+    }
+    return mean_loss, average_precision
 
 
 def _validate_source(model, criterion, data_loader, device):
@@ -1010,6 +1057,7 @@ def main():
     )
     target_train_loader = None
     target_validate_loader = None
+    target_ap_loader = None
     if use_target:
         target_train_loader = _make_loader(
             target_train_dataset,
@@ -1026,6 +1074,18 @@ def main():
             shuffle=False,
             drop_last=False,
             pin_memory=pin_memory,
+        )
+        # OpenCOOD post-processing is defined for batch size one. Keep this
+        # separate from the loss loader so validation losses remain directly
+        # comparable with earlier runs.
+        target_ap_loader = _make_loader(
+            target_validate_dataset,
+            1,
+            num_workers,
+            shuffle=False,
+            drop_last=False,
+            pin_memory=pin_memory,
+            evaluation=True,
         )
 
     print("Creating collaborative domain-adaptation model")
@@ -1463,15 +1523,35 @@ def main():
                 target_validation_loss = _validate_target(
                     model, criterion, target_validate_loader, device
                 )
+                _, target_average_precision = _validate_detection(
+                    model,
+                    criterion,
+                    target_ap_loader,
+                    device,
+                    domain="target",
+                    calculate_ap=True,
+                )
                 writer.add_scalar(
                     "Validate/target_loss",
                     target_validation_loss,
                     epoch,
                 )
+                for threshold, average_precision in (
+                    target_average_precision.items()
+                ):
+                    writer.add_scalar(
+                        f"Validate/target_ap{int(threshold * 100)}",
+                        average_precision,
+                        epoch,
+                    )
                 print(
-                    f"Epoch {epoch}: target validation loss "
-                    f"{target_validation_loss:.4f} "
-                    "(logging only; does not select the best checkpoint)"
+                    f"Epoch {epoch} (net_epoch{epoch + 1}): "
+                    "target validation loss "
+                    f"{target_validation_loss:.4f}; "
+                    f"AP30={target_average_precision[0.3]:.4f} "
+                    f"AP50={target_average_precision[0.5]:.4f} "
+                    f"AP70={target_average_precision[0.7]:.4f} "
+                    "(logging only; target labels do not select checkpoints)"
                 )
 
             if source_validation_loss < best_validation_loss:

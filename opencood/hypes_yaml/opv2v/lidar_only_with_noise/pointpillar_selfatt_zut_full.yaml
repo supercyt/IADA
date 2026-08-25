@@ -4,12 +4,12 @@ name: zut_opv2v_point_pillar_selfatt_full
 root_dir: "/home/caoyitong/DataProjects/v2x_datasets/ZUT_OPV2V/train_full"
 # train+validate are intentionally merged for the final prelabel model.
 # This mirror only monitors optimization loss; it is not an unbiased split.
-validate_dir: "/home/caoyitong/DataProjects/v2x_datasets/ZUT_OPV2V/train_full"
-test_dir: "/home/caoyitong/DataProjects/v2x_datasets/ZUT_OPV2V/test_labeled"
+validate_dir: "/home/caoyitong/DataProjects/v2x_datasets/ZUT_OPV2V/validate"
+test_dir: "/home/caoyitong/DataProjects/v2x_datasets/ZUT_OPV2V/test"
 
 train_params:
-  epoches: 120
+  epoches: 30
   save_freq: 2
 
 lr_scheduler:
-  step_size: [80, 105]
+  step_size: [10, 15, 25]

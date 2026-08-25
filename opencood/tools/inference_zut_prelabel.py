@@ -20,6 +20,7 @@ import opencood.hypes_yaml.yaml_utils as yaml_utils
 from opencood.data_utils.datasets import build_dataset
 from opencood.tools import inference_utils, train_utils
 from opencood.utils import box_utils
+from opencood.utils.transformation_utils import x1_to_x2
 
 
 DEFAULT_TEST = Path("/home/caoyitong/DataProjects/v2x_datasets/ZUT_OPV2V/test")
@@ -98,6 +99,19 @@ def tensor_numpy(value) -> np.ndarray:
     if isinstance(value, torch.Tensor):
         return value.detach().cpu().numpy()
     return np.asarray(value)
+
+
+def prediction_to_front_transform(batch_data) -> tuple[np.ndarray, str]:
+    """Return the transform from the selected ego to front-CAV coordinates."""
+    cav_ids = [str(value) for value in batch_data["ego"]["cav_id_list"]]
+    if not cav_ids or cav_ids[0] not in {"0", "1"}:
+        raise ValueError(f"unexpected CAV order: {cav_ids}")
+    if "0" not in cav_ids:
+        raise ValueError("front CAV 0 is required for SUSTechPOINTS export")
+    poses = tensor_numpy(batch_data["ego"]["lidar_pose_clean"]).reshape(-1, 6)
+    ego_id = cav_ids[0]
+    transform = x1_to_x2(poses[0], poses[cav_ids.index("0")])
+    return transform, ego_id
 
 
 def angle_difference(first: float, second: float) -> float:
@@ -198,10 +212,12 @@ def main() -> int:
                      "scores": np.empty((0,))})
                 continue
             batch_data = train_utils.to_device(batch_data, device)
+            ego_to_front, ego_id = prediction_to_front_transform(batch_data)
             result = run_inference(args.fusion_method, batch_data, model, dataset)
             corners = tensor_numpy(result["pred_box_tensor"])
             scores = tensor_numpy(result["pred_score"]).reshape(-1)
             if corners.size:
+                corners = box_utils.project_box3d(corners, ego_to_front)
                 boxes = box_utils.corner_to_center(corners, order="lwh")
                 mask = scores >= args.score_threshold
                 boxes, scores = boxes[mask], scores[mask]
@@ -209,7 +225,8 @@ def main() -> int:
                 boxes = np.empty((0, 7), dtype=np.float32)
                 scores = np.empty((0,), dtype=np.float32)
             predictions[scenario].append(
-                {"timestamp": timestamp, "boxes": boxes, "scores": scores})
+                {"timestamp": timestamp, "boxes": boxes, "scores": scores,
+                 "ego_id": ego_id})
             if (index + 1) % 25 == 0 or index + 1 == len(dataset):
                 print(f"inference {index + 1}/{len(dataset)}", flush=True)
 
@@ -252,6 +269,8 @@ def main() -> int:
         "test_dir": str(args.test_dir.resolve()),
         "score_threshold": args.score_threshold,
         "tracking_distance": args.tracking_distance,
+        "inference_ego": "1 (rear)",
+        "export_coordinate": "0 (front/SUSTechPOINTS)",
         "frames": frame_count,
         "car_boxes": box_count,
         "frame_results": report_frames,

@@ -10,12 +10,14 @@ model:
       iada_effect_memory_enabled: false
 
 domain_adaptation:
-  iada_safe_weight: 0.05
+  # The first run was almost entirely driven by the adversarial objectives.
+  # Rebalance toward source safety and use a slower, bounded adversarial game.
+  iada_safe_weight: 0.2
   iada_correction_weight: 0.0
   iada_utility_weight: 0.0
   iada_consistency_weight: 0.0
   iada_effect_weight: 0.0
-  iada_global_domain_weight: 0.05
-  iada_local_domain_weight: 0.05
+  iada_global_domain_weight: 0.02
+  iada_local_domain_weight: 0.02
   iada_gate_identity_weight: 0.1
-  iada_effect_variance_weight: 0.01
+  iada_effect_variance_weight: 0.0
