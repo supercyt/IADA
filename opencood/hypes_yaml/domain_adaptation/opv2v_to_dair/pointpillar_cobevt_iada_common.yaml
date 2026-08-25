@@ -1,0 +1,27 @@
+base_config: pointpillar_cobevt_iada.yaml
+
+# Shared by the cumulative CoBEVT IADA ablations. Pass the matching CoBEVT
+# source-only checkpoint with --pretrained_model_dir; do not warm-start from
+# AttFuse even though the base YAML inherits its common detector settings.
+model:
+  args:
+    domain_adapter:
+      # CoBEVT fuses the common 100 x 252 comparison grid.
+      iada_local_topk: 512
+
+train_params:
+  epoches: 15
+  eval_freq: 1
+  save_freq: 1
+
+domain_adaptation:
+  stage: iada
+  pretrained_model_dir: ""
+  pretrained_lr_scale: 0.05
+  adapter_lr_scale: 0.5
+  iada_gate_identity_weight: 0.1
+  iada_effect_variance_weight: 0.0
+  grl:
+    max_value: 0.5
+    gamma: 5.0
+

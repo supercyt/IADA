@@ -489,6 +489,80 @@ class V2XViTFusion(nn.Module):
         
         return fused_feature
 
+
+class CoBEVT(nn.Module):
+    """CoBEVT masked swap-attention fusion for homogeneous BEV features."""
+
+    def __init__(self, args):
+        super().__init__()
+        from einops.layers.torch import Rearrange, Reduce
+        from opencood.models.fuse_modules.swap_fusion_modules import (
+            SwapFusionBlockMask,
+        )
+
+        self.agent_size = int(args["agent_size"])
+        self.window_size = int(args["window_size"])
+        input_dim = int(args["input_dim"])
+        self.layers = nn.ModuleList(
+            SwapFusionBlockMask(
+                input_dim=input_dim,
+                mlp_dim=int(args["mlp_dim"]),
+                dim_head=int(args["dim_head"]),
+                window_size=self.window_size,
+                agent_size=self.agent_size,
+                drop_out=float(args["drop_out"]),
+            )
+            for _ in range(int(args["depth"]))
+        )
+        self.mlp_head = nn.Sequential(
+            Reduce("b m d h w -> b d h w", "mean"),
+            Rearrange("b d h w -> b h w d"),
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, input_dim),
+            Rearrange("b h w d -> b d h w"),
+        )
+
+    def forward(self, features, record_len, affine_matrix):
+        _, channels, height, width = features.shape
+        batch_size, max_agents = affine_matrix.shape[:2]
+        if max_agents != self.agent_size:
+            raise ValueError(
+                "CoBEVT agent_size must equal pairwise matrix max agents; "
+                f"got {self.agent_size} and {max_agents}"
+            )
+        if height % self.window_size or width % self.window_size:
+            raise ValueError(
+                "CoBEVT feature height and width must be divisible by "
+                f"window_size={self.window_size}; got {(height, width)}"
+            )
+        if int(record_len.max().item()) > self.agent_size:
+            raise ValueError("CoBEVT record_len exceeds configured agent_size")
+
+        regrouped, mask = Regroup(features, record_len, self.agent_size)
+        regrouped = regrouped.to(dtype=features.dtype)
+        mask = mask.to(device=features.device, dtype=torch.bool)
+        communication_mask = mask[:, None, None, None, :].expand(
+            batch_size, height, width, 1, self.agent_size
+        )
+
+        warped = []
+        for batch_index in range(batch_size):
+            warped.append(
+                warp_affine_simple(
+                    regrouped[batch_index],
+                    affine_matrix[batch_index, 0],
+                    (height, width),
+                )
+            )
+        output = torch.stack(warped)
+        for layer in self.layers:
+            output = layer(output, mask=communication_mask)
+        output = self.mlp_head(output)
+        if output.shape != (batch_size, channels, height, width):
+            raise RuntimeError("CoBEVT produced an unexpected output shape")
+        return output
+
+
 class When2commFusion(nn.Module):
     def __init__(self, args):
         super(When2commFusion, self).__init__()

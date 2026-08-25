@@ -6,7 +6,7 @@ interface. The target domain is DAIR-V2X and the source domain is OPV2V.
 
 ## Configurations
 
-All three fusion backbones use `point_pillar_baseline`. The adapter receives
+All fusion backbones use `point_pillar_baseline`. The adapter receives
 the per-agent feature before fusion and the collaborative ego-centric feature
 after the native fusion module, so the detector and fusion parameter names stay
 compatible with their source-only checkpoints.
@@ -16,6 +16,20 @@ compatible with their source-only checkpoints.
 | single-scale AttFuse | [AttFuse YAML](../../opencood/hypes_yaml/domain_adaptation/opv2v_to_dair/pointpillar_attfuse_iada.yaml) | `384 x 100 x 252` |
 | DiscoNet, student-only | [DiscoNet YAML](../../opencood/hypes_yaml/domain_adaptation/opv2v_to_dair/pointpillar_disconet_da.yaml) | `256 x 100 x 252` |
 | V2X-ViT | [V2X-ViT YAML](../../opencood/hypes_yaml/domain_adaptation/opv2v_to_dair/pointpillar_v2xvit_da.yaml) | `256 x 100 x 252` |
+| CoBEVT | [CoBEVT YAML](../../opencood/hypes_yaml/domain_adaptation/opv2v_to_dair/pointpillar_cobevt_iada.yaml) | `256 x 100 x 252` |
+| PyramidFusion | [PyramidFusion YAML](../../opencood/hypes_yaml/domain_adaptation/opv2v_to_dair/pointpillar_pyramid_iada.yaml) | `256 x 100 x 252` |
+
+CoBEVT retains HEAL's masked window/grid swap attention, with `agent_size: 2`
+and `window_size: 4` for the shared OPV2V-to-DAIR protocol. PyramidFusion
+retains its occupancy-guided multi-scale weighted fusion, but its optional
+single-agent occupancy loss is disabled. Consequently all fusion backbones
+use the same source detection supervision and adaptation-stage losses. The
+occupancy heads still receive gradients through their fusion weights.
+
+PyramidFusion supports the baseline, GRL, DUSA, CUDA-X, and IADA stages. SSDA
+is rejected explicitly because its FSA operation must alter the native
+pre-fusion representation, while PyramidFusion fuses internally across three
+feature scales.
 
 The AttFuse filename is retained for compatibility with existing commands, but
 the file now supports every stage below. DiscoNet deliberately uses the common

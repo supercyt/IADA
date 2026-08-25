@@ -1,0 +1,31 @@
+base_config: pointpillar_pyramid_iada.yaml
+
+# Shared by the cumulative PyramidFusion IADA ablations. Pass the matching
+# baseline directory with --pretrained_model_dir; never warm-start from a
+# different fusion backbone or another adaptation run.
+model:
+  args:
+    domain_adapter:
+      iada_local_topk: 512
+
+train_params:
+  epoches: 15
+  eval_freq: 1
+  save_freq: 1
+
+lr_scheduler:
+  core_method: multistep #step, multistep and Exponential support
+  gamma: 0.1
+  step_size: [5, 10]
+
+domain_adaptation:
+  stage: iada
+  pretrained_model_dir: ""
+  pretrained_lr_scale: 0.05
+  adapter_lr_scale: 0.5
+  iada_gate_identity_weight: 0.1
+  iada_effect_variance_weight: 0.0
+  grl:
+    max_value: 0.5
+    gamma: 5.0
+

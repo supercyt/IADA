@@ -8,12 +8,14 @@ import torch.nn as nn
 
 from opencood.models.fuse_modules.fusion_in_one import (
     AttFusion,
+    CoBEVT,
     DiscoFusion,
     MaxFusion,
     V2VNetFusion,
     V2XViTFusion,
     When2commFusion,
 )
+from opencood.models.fuse_modules.pyramid_fuse import PyramidFusion
 from opencood.models.sub_modules.domain_adaptation import build_domain_adapter
 from opencood.models.sub_modules.pillar_vfe import PillarVFE
 from opencood.models.sub_modules.point_pillar_scatter import PointPillarScatter
@@ -44,6 +46,10 @@ class PointPillarBaseline(nn.Module):
 
         fusion_method = args['fusion_method']
         self.fusion_method = fusion_method
+        self.pyramid_fusion = fusion_method == "pyramid"
+        self.pyramid_aux_enabled = bool(
+            args.get("pyramid_aux_loss", {}).get("enabled", False)
+        )
         if fusion_method == "max":
             self.fusion_net = MaxFusion()
         elif fusion_method == "att":
@@ -54,6 +60,13 @@ class PointPillarBaseline(nn.Module):
             self.fusion_net = V2VNetFusion(args['v2vnet'])
         elif fusion_method == 'v2xvit':
             self.fusion_net = V2XViTFusion(args['v2xvit'])
+        elif fusion_method == 'cobevt':
+            self.fusion_net = CoBEVT(args['cobevt'])
+        elif fusion_method == 'pyramid':
+            self.fusion_net = PyramidFusion(
+                args['pyramid'],
+                input_channels=self.backbone.num_bev_features,
+            )
         elif fusion_method == 'when2comm':
             self.fusion_net = When2commFusion(args['when2comm'])
         else:
@@ -61,7 +74,12 @@ class PointPillarBaseline(nn.Module):
                 f"Unsupported PointPillar fusion_method: {fusion_method!r}"
             )
 
-        self.out_channel = sum(args['base_bev_backbone']['num_upsample_filter'])
+        output_backbone = (
+            args['pyramid']
+            if self.pyramid_fusion
+            else args['base_bev_backbone']
+        )
+        self.out_channel = sum(output_backbone['num_upsample_filter'])
 
         self.shrink_flag = False
         if 'shrink_header' in args:
@@ -91,6 +109,15 @@ class PointPillarBaseline(nn.Module):
             detection_channels=self.out_channel,
             lidar_range=tuple(args['lidar_range']),
         )
+        if (
+            self.pyramid_fusion
+            and self.domain_adapter is not None
+            and self.domain_adapter.method == "ssda"
+        ):
+            raise ValueError(
+                "PyramidFusion does not support SSDA's pre-fusion FSA hook; "
+                "baseline, GRL, DUSA, CUDA-X, and IADA are supported"
+            )
 
         if 'backbone_fix' in args.keys() and args['backbone_fix']:
             self.backbone_fix()
@@ -140,40 +167,68 @@ class PointPillarBaseline(nn.Module):
         batch_dict = self.backbone(batch_dict)
 
         spatial_features_2d = batch_dict['spatial_features_2d']
-
-        if self.shrink_flag:
-            spatial_features_2d = self.shrink_conv(spatial_features_2d)
-
-        if self.compression:
-            spatial_features_2d = self.naive_compressor(spatial_features_2d)
-
-        agent_features = spatial_features_2d
         adaptation_context = {}
-        if self.domain_adapter is not None:
-            agent_features, adaptation_context = \
-                self.domain_adapter.adapt_agents(
-                    agent_features,
-                    record_len,
+        occupancy_outputs = None
+        if self.pyramid_fusion:
+            if self.compression:
+                raise ValueError(
+                    "PyramidFusion does not support decoded-feature compression"
                 )
-        if self.fusion_method == 'v2xvit':
-            prior_encoding = data_dict.get('prior_encoding')
-            # The data interface stores priors as float32. Match the active
-            # feature dtype here so V2X-ViT remains valid under autocast while
-            # its direct fusion API can still enforce a strict dtype contract.
-            if (torch.is_tensor(prior_encoding)
-                    and prior_encoding.is_floating_point()
-                    and prior_encoding.device == agent_features.device):
-                prior_encoding = prior_encoding.to(agent_features.dtype)
-            fused_feature = self.fusion_net(
-                agent_features,
+            needs_agent_features = self.domain_adapter is not None
+            pyramid_output = self.fusion_net.forward_collab(
+                spatial_features_2d,
                 record_len,
                 normalized_affine_matrix,
-                prior_encoding=prior_encoding,
+                return_agent_features=needs_agent_features,
             )
+            if needs_agent_features:
+                fused_feature, occupancy_outputs, agent_features = (
+                    pyramid_output
+                )
+            else:
+                fused_feature, occupancy_outputs = pyramid_output
+                agent_features = None
+            if self.shrink_flag:
+                if agent_features is not None:
+                    agent_features = self.shrink_conv(agent_features)
+                fused_feature = self.shrink_conv(fused_feature)
+            if self.domain_adapter is not None:
+                agent_features, adaptation_context = (
+                    self.domain_adapter.adapt_agents(
+                        agent_features, record_len
+                    )
+                )
         else:
-            fused_feature = self.fusion_net(
-                agent_features, record_len, normalized_affine_matrix
-            )
+            if self.shrink_flag:
+                spatial_features_2d = self.shrink_conv(spatial_features_2d)
+            if self.compression:
+                spatial_features_2d = self.naive_compressor(
+                    spatial_features_2d
+                )
+            agent_features = spatial_features_2d
+            if self.domain_adapter is not None:
+                agent_features, adaptation_context = (
+                    self.domain_adapter.adapt_agents(
+                        agent_features, record_len
+                    )
+                )
+            if self.fusion_method == 'v2xvit':
+                prior_encoding = data_dict.get('prior_encoding')
+                # Match the explicit prior to autocast feature dtype.
+                if (torch.is_tensor(prior_encoding)
+                        and prior_encoding.is_floating_point()
+                        and prior_encoding.device == agent_features.device):
+                    prior_encoding = prior_encoding.to(agent_features.dtype)
+                fused_feature = self.fusion_net(
+                    agent_features,
+                    record_len,
+                    normalized_affine_matrix,
+                    prior_encoding=prior_encoding,
+                )
+            else:
+                fused_feature = self.fusion_net(
+                    agent_features, record_len, normalized_affine_matrix
+                )
 
         if self.domain_adapter is not None:
             fused_feature, fused_context = \
@@ -192,6 +247,9 @@ class PointPillarBaseline(nn.Module):
 
         output_dict = {'cls_preds': psm,
                        'reg_preds': rm}
+
+        if self.pyramid_aux_enabled:
+            output_dict['occ_single_list'] = occupancy_outputs
 
         if self.use_dir:
             output_dict.update({'dir_preds': self.dir_head(fused_feature)})
