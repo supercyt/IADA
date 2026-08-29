@@ -84,6 +84,10 @@ def main():
     source_dataset = build_dataset(
         source_hypes, visualize=False, train=True
     )
+    # RCE bounds depend only on source GT boxes and anchors. Avoid loading and
+    # voxelizing LiDAR here; on OPV2V this reduces a full scan from tens of
+    # minutes to a small label-only preprocessing job.
+    source_dataset.load_lidar_file = False
     bounds, positive_count, sample_count = compute_source_residual_bounds(
         source_dataset, options.max_samples
     )

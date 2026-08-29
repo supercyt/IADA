@@ -8,16 +8,16 @@ test_dir: "/home/caoyitong/DataProjects/v2x_datasets/ZUT_OPV2V/test"
 noise_setting:
   add_noise: false
   args:
-    pos_std: 0.0
-    rot_std: 0.0
+    pos_std: 0.2
+    rot_std: 0.2
     pos_mean: 0.0
     rot_mean: 0.0
 
 yaml_parser: "load_point_pillar_params"
 train_params:
   batch_size: &batch_size 4
-  epoches: 200
-  eval_freq: 1
+  epoches: 30
+  eval_freq: 2
   save_freq: 2
   max_cav: &max_cav 2
 
@@ -130,4 +130,4 @@ optimizer:
 lr_scheduler:
   core_method: multistep
   gamma: 0.1
-  step_size: [140, 180]
+  step_size: [10, 15, 25]

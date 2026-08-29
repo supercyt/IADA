@@ -1,0 +1,21 @@
+base_config: pointpillar_pyramid_iada.yaml
+
+# Keep adaptation baselines on the same 15-epoch schedule as IADA.
+name: opv2v_to_v2v4real_pointpillar_pyramid_comparison
+train_params:
+  epoches: 15
+  eval_freq: 1
+  save_freq: 1
+
+model:
+  args:
+    domain_adapter:
+      ssda_hidden_dim: 128
+      sao_enabled: true
+      sao_probability: 1.0
+      fsa_epsilon: 0.00001
+      ssda_detach_attention: false
+
+domain_adaptation:
+  ssda_global_weight: 0.5
+  ssda_local_weight: 1.0

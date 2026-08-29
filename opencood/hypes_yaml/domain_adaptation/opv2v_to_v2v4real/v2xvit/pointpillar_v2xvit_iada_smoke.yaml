@@ -1,0 +1,21 @@
+base_config: pointpillar_v2xvit_iada.yaml
+
+name: opv2v_to_v2v4real_pointpillar_v2xvit_smoke
+max_samples: 4
+# Skip the two leading training scenarios whose CAV separation exceeds the
+# official 70 m communication range, so the smoke test exercises adaptation.
+sample_offset: 552
+train_params:
+  batch_size: 1
+  epoches: 2
+  eval_freq: 1
+  save_freq: 1
+  max_cav: 2
+domain_adaptation:
+  source:
+    max_samples: 4
+  source_batch_size: 1
+  target_batch_size: 1
+  num_workers: 0
+  steps_per_epoch: 2
+  log_freq: 1

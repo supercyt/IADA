@@ -1,4 +1,4 @@
-"""Utilities shared by the OPV2V-to-DAIR Sim2Real training path."""
+"""Utilities shared by collaborative Sim2Real training paths."""
 
 from __future__ import annotations
 
@@ -75,6 +75,13 @@ def build_source_config(
 
     source_config = deepcopy(dict(target_config))
     _deep_merge_in_place(source_config, source_overrides)
+    for key in domain_adaptation.get("source_drop_keys", ()):
+        if not isinstance(key, str) or not key:
+            raise ValueError(
+                "domain_adaptation.source_drop_keys must contain non-empty "
+                "top-level config keys"
+            )
+        source_config.pop(key, None)
     if not keep_domain_adaptation:
         source_config.pop("domain_adaptation", None)
 
@@ -297,13 +304,14 @@ def _canonical_prior_encoding(
     record_len: torch.Tensor,
     pairwise_t_matrix: torch.Tensor,
     domain: str,
+    agent_type: str,
 ) -> torch.Tensor:
     """Build and validate the V2X-ViT ``[velocity, delay, type]`` prior.
 
-    OPV2V contains vehicles only, so every source value is zero. DAIR-V2X
-    collates the vehicle first and roadside infrastructure second; therefore
-    only local agent index 1 in a two-or-more-agent target scene receives type
-    1. Single-agent scenes and padded slots remain zero.
+    Vehicle-only datasets use zero for every valid and padded agent. V2I
+    datasets collate the vehicle first and roadside infrastructure second;
+    therefore only local agent index 1 in a two-or-more-agent scene receives
+    type 1. Single-agent scenes and padded slots remain zero.
 
     A batch-provided prior is treated as an assertion, not as an override. It
     must exactly match this domain-derived value. This prevents stale dataset
@@ -313,6 +321,8 @@ def _canonical_prior_encoding(
 
     if domain not in ("source", "target"):
         raise ValueError("prior domain must be 'source' or 'target'")
+    if agent_type not in ("v2v", "v2i"):
+        raise ValueError("agent_type must be 'v2v' or 'v2i'")
     batch_size = int(record_len.numel())
     max_agents = int(pairwise_t_matrix.shape[1])
     canonical = torch.zeros(
@@ -322,7 +332,7 @@ def _canonical_prior_encoding(
         dtype=torch.float32,
         device=record_len.device,
     )
-    if domain == "target":
+    if agent_type == "v2i":
         has_infrastructure = record_len >= 2
         canonical[has_infrastructure, 1, 2] = 1.0
 
@@ -357,6 +367,7 @@ def _canonical_prior_encoding(
 def build_prior_encoding(
     ego: Mapping[str, Any],
     domain: str,
+    agent_type: str | None = None,
 ) -> torch.Tensor:
     """Return the canonical padded prior for one collated domain batch."""
 
@@ -384,14 +395,18 @@ def build_prior_encoding(
         )
     if not bool((record_len <= pairwise_t_matrix.shape[1]).all().item()):
         raise ValueError(f"{domain} record_len exceeds pairwise padding size")
+    if agent_type is None:
+        # Preserve the historical OPV2V->DAIR behavior for external callers.
+        agent_type = "v2v" if domain == "source" else "v2i"
     return _canonical_prior_encoding(
-        ego, record_len, pairwise_t_matrix, domain
+        ego, record_len, pairwise_t_matrix, domain, agent_type
     )
 
 
 def merge_source_target_batches(
     source_ego: Mapping[str, Any],
     target_ego: Mapping[str, Any],
+    target_agent_type: str = "v2i",
 ) -> Tuple[_Batch, int, torch.Tensor]:
     """Merge collated source/target ego batches without target labels.
 
@@ -439,10 +454,14 @@ def merge_source_target_batches(
         )
 
     source_prior = _canonical_prior_encoding(
-        source_ego, source_record_len, source_pairwise, "source"
+        source_ego, source_record_len, source_pairwise, "source", "v2v"
     )
     target_prior = _canonical_prior_encoding(
-        target_ego, target_record_len, target_pairwise, "target"
+        target_ego,
+        target_record_len,
+        target_pairwise,
+        "target",
+        target_agent_type,
     )
 
     target_voxel_coords = target_lidar["voxel_coords"].clone()

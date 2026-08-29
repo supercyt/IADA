@@ -1,0 +1,297 @@
+name: opv2v_to_zut_pointpillar_v2xvit_da
+data_dir: null
+root_dir: /home/caoyitong/DataProjects/v2x_datasets/ZUT_OPV2V/train
+validate_dir: /home/caoyitong/DataProjects/v2x_datasets/ZUT_OPV2V/validate
+test_dir: /home/caoyitong/DataProjects/v2x_datasets/ZUT_OPV2V/test
+yaml_parser: load_point_pillar_params
+train_params:
+  batch_size: 4
+  epoches: 30
+  eval_freq: 2
+  save_freq: 2
+  max_cav: 2
+noise_setting:
+  add_noise: false
+  args:
+    pos_std: 0.0
+    rot_std: 0.0
+    pos_mean: 0.0
+    rot_mean: 0.0
+input_source:
+- lidar
+label_type: lidar
+comm_range: 70
+fusion:
+  core_method: intermediate
+  dataset: opv2v
+  args:
+    proj_first: false
+preprocess:
+  core_method: SpVoxelPreprocessor
+  args:
+    voxel_size: &id003
+    - 0.4
+    - 0.4
+    - 8
+    max_points_per_voxel: 32
+    max_voxel_train: 32000
+    max_voxel_test: 70000
+  cav_lidar_range: &id001
+  - -64
+  - -32
+  - -4
+  - 64
+  - 32
+  - 4
+data_augment: []
+postprocess:
+  core_method: VoxelPostprocessor
+  gt_range: *id001
+  anchor_args:
+    cav_lidar_range: *id001
+    l: 4.32
+    w: 1.98
+    h: 1.86
+    r: &id002
+    - 0
+    - 90
+    feature_stride: 2
+    num: 2
+  target_args:
+    pos_threshold: 0.6
+    neg_threshold: 0.45
+    score_threshold: 0.2
+  order: hwl
+  max_num: 32
+  nms_thresh: 0.15
+  dir_args:
+    dir_offset: 0.7853
+    num_bins: 2
+    anchor_yaw: *id002
+model:
+  core_method: point_pillar_baseline
+  args:
+    voxel_size: *id003
+    lidar_range: *id001
+    anchor_number: 2
+    pillar_vfe:
+      use_norm: true
+      with_distance: false
+      use_absolute_xyz: true
+      num_filters:
+      - 64
+    point_pillar_scatter:
+      num_features: 64
+    base_bev_backbone:
+      resnet: false
+      voxel_size: *id003
+      layer_nums:
+      - 3
+      - 5
+      - 8
+      layer_strides:
+      - 2
+      - 2
+      - 2
+      num_filters:
+      - 64
+      - 128
+      - 256
+      upsample_strides:
+      - 1
+      - 2
+      - 4
+      num_upsample_filter:
+      - 128
+      - 128
+      - 128
+    shrink_header:
+      kernal_size:
+      - 3
+      stride:
+      - 1
+      padding:
+      - 1
+      dim:
+      - 256
+      input_dim: 384
+    fusion_method: v2xvit
+    v2xvit:
+      prior_encoding_fallback: local_index_1_infra
+      transformer:
+        encoder:
+          num_blocks: 1
+          depth: 3
+          use_roi_mask: true
+          use_RTE: false
+          RTE_ratio: 0
+          cav_att_config:
+            dim: 256
+            use_hetero: true
+            use_RTE: false
+            RTE_ratio: 0
+            heads: 8
+            dim_head: 32
+            dropout: 0.3
+          pwindow_att_config:
+            dim: 256
+            heads:
+            - 16
+            - 8
+            - 4
+            dim_head:
+            - 16
+            - 32
+            - 64
+            dropout: 0.3
+            window_size:
+            - 1
+            - 2
+            - 4
+            relative_pos_embedding: true
+            fusion_method: split_attn
+          feed_forward:
+            mlp_dim: 256
+            dropout: 0.3
+          sttf:
+            voxel_size:
+            - 0.4
+            - 0.4
+            - 5
+            downsample_rate: 2
+    domain_adapter:
+      enabled: false
+      method: none
+      hidden_dim: 128
+      feature_size:
+      - 80
+      - 160
+      dusa_lsa_hidden_dim: 1024
+      dusa_cia_hidden_dim: 512
+      lsa_grl_scale: 0.05
+      cia_grl_scale: 0.1
+      graph_dim: 256
+      geometry_scale: 100.0
+      normalize_domain_embedding: true
+      iada_hidden_dim: 64
+      iada_effect_dim: 64
+      iada_gate_limit: 0.25
+      iada_domain_hidden_dim: 64
+      iada_local_topk: 256
+      iada_source_supervision_enabled: true
+      iada_target_consistency_enabled: false
+      iada_effect_memory_enabled: false
+      iada_consistency_dropout: 0.1
+      iada_teacher_momentum: 0.999
+      iada_prototype_momentum: 0.99
+      cudax_hidden_dim: 256
+      ckt_groups: 8
+      ckt_shuffle_groups: 2
+      cudax_bin_count: 5
+      cpa_hidden_dim: 1024
+    dir_args:
+      dir_offset: 0.7853
+      num_bins: 2
+      anchor_yaw: *id002
+loss:
+  core_method: point_pillar_loss
+  args:
+    pos_cls_weight: 2.0
+    cls:
+      type: SigmoidFocalLoss
+      alpha: 0.25
+      gamma: 2.0
+      weight: 2.0
+    reg:
+      type: WeightedSmoothL1Loss
+      sigma: 3.0
+      codewise: true
+      weight: 2.0
+    dir:
+      type: WeightedSoftmaxClassificationLoss
+      weight: 0.2
+      args:
+        dir_offset: 0.7853
+        num_bins: 2
+        anchor_yaw:
+        - 0
+        - 90
+optimizer:
+  core_method: Adam
+  lr: 0.001
+  args:
+    eps: 1.0e-10
+    weight_decay: 0.0001
+lr_scheduler:
+  core_method: multistep
+  gamma: 0.1
+  step_size:
+  - 10
+  - 50
+domain_adaptation:
+  stage: baseline
+  mode: source_only
+  seed: 303
+  source:
+    root_dir: /home/caoyitong/DataProjects/v2x_datasets/OPV2V/train
+    validate_dir: /home/caoyitong/DataProjects/v2x_datasets/OPV2V/validate
+    test_dir: /home/caoyitong/DataProjects/v2x_datasets/OPV2V/test
+    fusion:
+      dataset: opv2v
+  source_batch_size: 4
+  target_batch_size: 4
+  num_workers: 8
+  steps_per_epoch: null
+  log_freq: 10
+  domain_loss_weight: 0.1
+  dusa_lsa_weight: 1.0
+  dusa_cia_weight: 1.0
+  cudax_bin_loss_weight: 0.1
+  cudax_domain_loss_weight: 0.1
+  iada_safe_weight: 0.05
+  iada_correction_weight: 0.0
+  iada_utility_weight: 0.0
+  iada_consistency_weight: 0.0
+  iada_effect_weight: 0.0
+  iada_global_domain_weight: 0.05
+  iada_local_domain_weight: 0.05
+  iada_gate_identity_weight: 0.1
+  iada_effect_variance_weight: 0.01
+  iada_effect_target_std: 0.05
+  iada_source_adapter_only: true
+  iada_target_adapter_only: true
+  iada_safe_margin: 0.0
+  iada_target_confidence_threshold: 0.6
+  iada_target_advantage_threshold: 0.03
+  iada_discovery_ego_threshold: 0.5
+  iada_refinement_error_threshold: 0.1
+  iada_prototype_momentum: 0.99
+  cudax_bin_count: 5
+  cudax_residual_bounds:
+  - 0.376056563
+  - 0.371073733
+  - 2.28725991
+  - 0.362110536
+  - 0.124143588
+  - 0.215238233
+  pretrained_lr_scale: 0.1
+  adapter_lr_scale: 1.0
+  graph_variance_weight: 1.0
+  graph_variance_target_std: 0.01
+  gradient_clip_norm: 10.0
+  grl:
+    max_value: 1.0
+    gamma: 10.0
+  pretrained_model_dir: ''
+  target_agent_type: v2v
+  source_drop_keys:
+  - fixed_ego_id
+  - remove_ego_object
+car_only: false
+fixed_ego_id: '1'
+remove_ego_object:
+  center:
+  - -2.38991334
+  - 0.25333039
+  - 0.73471033
+  tolerance: 1.0

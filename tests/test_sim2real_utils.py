@@ -160,6 +160,35 @@ class BuildSourceConfigTest(unittest.TestCase):
         with self.assertRaises(KeyError):
             build_source_config({"domain_adaptation": {}})
 
+    def test_can_drop_target_only_keys_from_source_config(self):
+        target_config = {
+            "ego_selection": {"train": "1", "eval": "1"},
+            "remove_ego_object": {"center": [0, 0, 0]},
+            "domain_adaptation": {
+                "source": {"root_dir": "opv2v/train"},
+                "source_drop_keys": [
+                    "ego_selection",
+                    "remove_ego_object",
+                ],
+            },
+        }
+
+        source_config = build_source_config(target_config)
+
+        self.assertNotIn("ego_selection", source_config)
+        self.assertNotIn("remove_ego_object", source_config)
+
+    def test_rejects_invalid_source_drop_key(self):
+        target_config = {
+            "domain_adaptation": {
+                "source": {},
+                "source_drop_keys": [""],
+            }
+        }
+
+        with self.assertRaisesRegex(ValueError, "source_drop_keys"):
+            build_source_config(target_config)
+
 
 class ForeverDataIteratorTest(unittest.TestCase):
     def test_rebuilds_iterator_after_exhaustion(self):
@@ -258,10 +287,30 @@ class MergeSourceTargetBatchesTest(unittest.TestCase):
         expected = torch.zeros(2, 3, 3)
         expected[1, 1, 2] = 1.0
         torch.testing.assert_close(prior, expected)
+
+    def test_prior_builder_keeps_v2v_target_agents_as_vehicles(self):
+        target = _ego_batch([1, 2], [0, 1, 2], max_agents=3)
+
+        prior = build_prior_encoding(target, "target", agent_type="v2v")
+
+        torch.testing.assert_close(prior, torch.zeros_like(prior))
         # The local-index-1 slot in the single-agent scene and every padded
         # slot must remain zero.
         self.assertEqual(prior[0, 1:].abs().sum().item(), 0.0)
         self.assertEqual(prior[1, 2].abs().sum().item(), 0.0)
+
+    def test_batch_merge_accepts_v2v_target_policy(self):
+        source = _ego_batch([2], [0, 1], max_agents=2)
+        target = _ego_batch([2], [0, 1], max_agents=2)
+
+        merged, _, _ = merge_source_target_batches(
+            source, target, target_agent_type="v2v"
+        )
+
+        torch.testing.assert_close(
+            merged["prior_encoding"],
+            torch.zeros_like(merged["prior_encoding"]),
+        )
 
     def test_existing_prior_is_validated_instead_of_silently_overridden(self):
         source = _ego_batch([2], [0, 1], max_agents=3)

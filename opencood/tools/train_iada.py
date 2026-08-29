@@ -1,4 +1,4 @@
-"""Train fusion-agnostic OPV2V-to-DAIR domain adaptation baselines."""
+"""Train fusion-agnostic collaborative domain-adaptation baselines."""
 
 import argparse
 import contextlib
@@ -149,6 +149,17 @@ def _adaptation_protocol_signature(hypes):
         "noise_setting": hypes.get("noise_setting"),
         "input_source": hypes.get("input_source"),
         "label_type": hypes.get("label_type"),
+        "target_agent_type": hypes.get("domain_adaptation", {}).get(
+            "target_agent_type"
+        ),
+        "fixed_ego_id": hypes.get("fixed_ego_id"),
+        "ego_selection": hypes.get("ego_selection"),
+        "remove_ego_object": hypes.get("remove_ego_object"),
+        "sample_offset": hypes.get("sample_offset", 0),
+        "max_samples": hypes.get("max_samples"),
+        "source_drop_keys": hypes.get("domain_adaptation", {}).get(
+            "source_drop_keys"
+        ),
         # DAIRV2XBaseDataset defaults missing legacy configs to the official
         # DUSA car-only protocol.  An explicit false remains a protocol change.
         "car_only": hypes.get("car_only", True),
@@ -188,8 +199,8 @@ def _validate_baseline_warm_start(pretrained_model_dir, current_hypes):
         != _adaptation_protocol_signature(current_hypes)
     ):
         raise ValueError(
-            "The baseline checkpoint does not use the same OPV2V source, "
-            "DAIR target splits, ROI, voxel grid, anchors, fusion setup, "
+            "The baseline checkpoint does not use the same OPV2V source and "
+            "target splits, ROI, voxel grid, anchors, fusion setup, "
             "max_cav, noise policy, and detector/fusion architecture as the "
             "current adaptation experiment."
         )
@@ -387,7 +398,7 @@ def _resolve_best_validation_path(saved_path, resume_state):
 
 def train_parser():
     parser = argparse.ArgumentParser(
-        description="OPV2V-to-DAIR collaborative domain adaptation"
+        description="Collaborative perception domain adaptation"
     )
     parser.add_argument(
         "--hypes_yaml", "-y", type=str, required=True
@@ -596,16 +607,33 @@ def _set_random_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def _select_model_inputs(ego_batch, domain="source"):
+def _select_model_inputs(
+    ego_batch, domain="source", agent_type=None
+):
     missing = [key for key in MODEL_INPUT_KEYS if key not in ego_batch]
     if missing:
         raise KeyError(f"Batch is missing model inputs: {missing}")
     model_inputs = {key: ego_batch[key] for key in MODEL_INPUT_KEYS}
-    # Source-only baseline/validation must not infer infrastructure from local
-    # index 1: OPV2V collaborators are all vehicles. An existing prior is
-    # validated by build_prior_encoding instead of being silently trusted.
-    model_inputs["prior_encoding"] = build_prior_encoding(ego_batch, domain)
+    # A batch-provided prior is validated instead of being silently trusted.
+    model_inputs["prior_encoding"] = build_prior_encoding(
+        ego_batch, domain, agent_type=agent_type
+    )
     return model_inputs
+
+
+def _target_agent_type(hypes):
+    """Return the V2V/V2I prior policy for the configured target dataset."""
+
+    configured = hypes.get("domain_adaptation", {}).get("target_agent_type")
+    if configured is not None:
+        configured = str(configured).lower()
+        if configured not in ("v2v", "v2i"):
+            raise ValueError(
+                "domain_adaptation.target_agent_type must be 'v2v' or 'v2i'"
+            )
+        return configured
+    dataset_name = str(hypes["fusion"]["dataset"]).lower()
+    return "v2i" if dataset_name == "dairv2x" else "v2v"
 
 
 def _merge_domain_outputs(
@@ -884,6 +912,7 @@ def _validate_detection(
     device,
     domain,
     calculate_ap=False,
+    agent_type=None,
 ):
     if domain not in ("source", "target"):
         raise ValueError("validation domain must be 'source' or 'target'")
@@ -906,7 +935,7 @@ def _validate_detection(
         else:
             ego_batch = batch_data["ego"]
         model_inputs = train_utils.to_device(
-            _select_model_inputs(ego_batch, domain), device
+            _select_model_inputs(ego_batch, domain, agent_type), device
         )
         model_inputs["grl_lambda"] = 0.0
         label_dict = train_utils.to_device(ego_batch["label_dict"], device)
@@ -956,9 +985,16 @@ def _validate_source(model, criterion, data_loader, device):
     )
 
 
-def _validate_target(model, criterion, data_loader, device):
+def _validate_target(
+    model, criterion, data_loader, device, agent_type="v2i"
+):
     return _validate_detection(
-        model, criterion, data_loader, device, domain="target"
+        model,
+        criterion,
+        data_loader,
+        device,
+        domain="target",
+        agent_type=agent_type,
     )
 
 
@@ -984,6 +1020,7 @@ def main():
         )
     stage = _configure_stage(hypes, opt.stage)
     da_cfg = hypes["domain_adaptation"]
+    target_agent_type = _target_agent_type(hypes)
     pretrained_model_dir = ""
     if opt.model_dir:
         # Runs created before this field existed could only be warm-started for
@@ -1011,7 +1048,9 @@ def main():
 
     print(f"Training stage: {stage}")
     print(f"Initialization: {initialization}")
-    print("Building source OPV2V datasets")
+    source_dataset_name = source_hypes["fusion"]["dataset"]
+    target_dataset_name = hypes["fusion"]["dataset"]
+    print(f"Building source {source_dataset_name} datasets")
     source_train_dataset = build_dataset(
         source_hypes, visualize=False, train=True
     )
@@ -1024,7 +1063,7 @@ def main():
     target_validate_dataset = None
     if use_target:
         print(
-            "Building target DAIR-V2X dataset "
+            f"Building target {target_dataset_name} dataset "
             "(target labels are excluded from model inputs and training losses)"
         )
         target_train_dataset = build_dataset(
@@ -1251,10 +1290,10 @@ def main():
                     continue
                 target_ego = target_batch["ego"]
                 source_model_inputs = _select_model_inputs(
-                    source_ego, "source"
+                    source_ego, "source", "v2v"
                 )
                 target_model_inputs = _select_model_inputs(
-                    target_ego, "target"
+                    target_ego, "target", target_agent_type
                 )
                 source_scene_count = int(
                     source_ego["record_len"].numel()
@@ -1268,7 +1307,9 @@ def main():
                     source_ego["record_len"], target_ego["record_len"]
                 )
             else:
-                source_model_inputs = _select_model_inputs(source_ego)
+                source_model_inputs = _select_model_inputs(
+                    source_ego, "source", "v2v"
+                )
                 source_scene_count = int(
                     source_ego["record_len"].numel()
                 )
@@ -1521,7 +1562,11 @@ def main():
 
             if target_validate_loader is not None:
                 target_validation_loss = _validate_target(
-                    model, criterion, target_validate_loader, device
+                    model,
+                    criterion,
+                    target_validate_loader,
+                    device,
+                    target_agent_type,
                 )
                 _, target_average_precision = _validate_detection(
                     model,
@@ -1530,6 +1575,7 @@ def main():
                     device,
                     domain="target",
                     calculate_ap=True,
+                    agent_type=target_agent_type,
                 )
                 writer.add_scalar(
                     "Validate/target_loss",
@@ -1600,7 +1646,7 @@ def main():
     writer.close()
     print(f"Training finished. Checkpoints saved to {saved_path}")
     print(
-        "Evaluate on DAIR-V2X with: "
+        f"Evaluate on {target_dataset_name} with: "
         f"python opencood/tools/inference.py --model_dir {saved_path} "
         "--fusion_method intermediate"
     )

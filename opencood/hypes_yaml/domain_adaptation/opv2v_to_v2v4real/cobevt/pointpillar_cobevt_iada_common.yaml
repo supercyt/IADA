@@ -1,0 +1,23 @@
+base_config: pointpillar_cobevt_iada.yaml
+
+model:
+  args:
+    domain_adapter:
+      iada_local_topk: 256
+
+train_params:
+  epoches: 15
+  eval_freq: 1
+  save_freq: 1
+
+domain_adaptation:
+  stage: iada
+  pretrained_model_dir: ''
+  pretrained_lr_scale: 0.05
+  adapter_lr_scale: 0.5
+  iada_gate_identity_weight: 0.1
+  iada_effect_variance_weight: 0.0
+  grl:
+    max_value: 0.5
+    gamma: 5.0
+

@@ -33,6 +33,7 @@ from opencood.tools.train_iada import (
     _validate_baseline_warm_start,
     _validate_detection,
     _target_adapter_only_parameters,
+    _target_agent_type,
     _trainable_adapter_parameters,
 )
 
@@ -225,6 +226,42 @@ class ValidationConfigTest(unittest.TestCase):
                 "rot_mean": 0,
             },
         )
+
+
+class TargetAgentTypeTest(unittest.TestCase):
+    def test_infers_v2i_only_for_dair(self):
+        self.assertEqual(
+            _target_agent_type(
+                {"fusion": {"dataset": "dairv2x"}, "domain_adaptation": {}}
+            ),
+            "v2i",
+        )
+        for dataset in ("opv2v", "v2v4real"):
+            with self.subTest(dataset=dataset):
+                self.assertEqual(
+                    _target_agent_type(
+                        {
+                            "fusion": {"dataset": dataset},
+                            "domain_adaptation": {},
+                        }
+                    ),
+                    "v2v",
+                )
+
+    def test_explicit_policy_takes_precedence(self):
+        hypes = {
+            "fusion": {"dataset": "opv2v"},
+            "domain_adaptation": {"target_agent_type": "v2i"},
+        }
+        self.assertEqual(_target_agent_type(hypes), "v2i")
+
+    def test_rejects_unknown_policy(self):
+        hypes = {
+            "fusion": {"dataset": "opv2v"},
+            "domain_adaptation": {"target_agent_type": "unknown"},
+        }
+        with self.assertRaisesRegex(ValueError, "target_agent_type"):
+            _target_agent_type(hypes)
 
 
 class DomainLossTest(unittest.TestCase):

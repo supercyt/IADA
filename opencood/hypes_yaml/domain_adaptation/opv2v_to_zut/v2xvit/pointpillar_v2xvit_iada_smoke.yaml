@@ -1,0 +1,19 @@
+base_config: pointpillar_v2xvit_iada.yaml
+
+name: opv2v_to_zut_pointpillar_v2xvit_smoke
+max_samples: 4
+train_params:
+  batch_size: 1
+  epoches: 2
+  eval_freq: 1
+  save_freq: 1
+  max_cav: 2
+domain_adaptation:
+  source:
+    max_samples: 4
+  source_batch_size: 1
+  target_batch_size: 1
+  num_workers: 0
+  steps_per_epoch: 2
+  log_freq: 1
+

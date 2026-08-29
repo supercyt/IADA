@@ -1,0 +1,19 @@
+base_config: pointpillar_attfuse_iada_common.yaml
+name: opv2v_to_v2v4real_pointpillar_attfuse_gate_iada
+model:
+  args:
+    domain_adapter:
+      iada_source_supervision_enabled: false
+      iada_target_consistency_enabled: false
+      iada_effect_memory_enabled: false
+domain_adaptation:
+  iada_safe_weight: 0.0
+  iada_correction_weight: 0.0
+  iada_utility_weight: 0.0
+  iada_consistency_weight: 0.0
+  iada_effect_weight: 0.0
+  iada_global_domain_weight: 0.0
+  iada_local_domain_weight: 0.0
+  iada_gate_identity_weight: 0.1
+  iada_effect_variance_weight: 0.0
+

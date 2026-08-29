@@ -1,0 +1,265 @@
+name: opv2v_to_v2v4real_pointpillar_cobevt_da
+data_dir: null
+root_dir: /home/caoyitong/DataProjects/v2x_datasets/V2V4Real/train
+validate_dir: /home/caoyitong/DataProjects/v2x_datasets/V2V4Real/val
+test_dir: /home/caoyitong/DataProjects/v2x_datasets/V2V4Real/test
+yaml_parser: load_point_pillar_params
+train_params:
+  batch_size: 2
+  epoches: 30
+  eval_freq: 2
+  save_freq: 2
+  max_cav: 2
+noise_setting:
+  add_noise: false
+  args:
+    pos_std: 0.0
+    rot_std: 0.0
+    pos_mean: 0.0
+    rot_mean: 0.0
+input_source:
+- lidar
+label_type: lidar
+car_only: false
+comm_range: 70
+fusion:
+  core_method: intermediate
+  dataset: v2v4real
+  args:
+    proj_first: false
+preprocess:
+  core_method: SpVoxelPreprocessor
+  args:
+    voxel_size: &id003
+    - 0.8
+    - 0.8
+    - 4
+    max_points_per_voxel: 32
+    max_voxel_train: 32000
+    max_voxel_test: 70000
+  cav_lidar_range: &id001
+  - -140.8
+  - -38.4
+  - -3
+  - 140.8
+  - 38.4
+  - 1
+data_augment: []
+postprocess:
+  core_method: VoxelPostprocessor
+  gt_range:
+  - -100
+  - -40
+  - -5
+  - 100
+  - 40
+  - 3
+  anchor_args:
+    cav_lidar_range: *id001
+    l: 3.9
+    w: 1.6
+    h: 1.56
+    r: &id002
+    - 0
+    - 90
+    feature_stride: 2
+    num: 2
+  target_args:
+    pos_threshold: 0.6
+    neg_threshold: 0.45
+    score_threshold: 0.1
+  order: hwl
+  max_num: 100
+  nms_thresh: 0.15
+  dir_args:
+    dir_offset: 0.7853
+    num_bins: 2
+    anchor_yaw: *id002
+model:
+  core_method: point_pillar_baseline
+  args:
+    voxel_size: *id003
+    lidar_range: *id001
+    anchor_number: 2
+    pillar_vfe:
+      use_norm: true
+      with_distance: false
+      use_absolute_xyz: true
+      num_filters:
+      - 64
+    point_pillar_scatter:
+      num_features: 64
+    base_bev_backbone:
+      resnet: false
+      voxel_size: *id003
+      layer_nums:
+      - 3
+      - 5
+      - 8
+      layer_strides:
+      - 2
+      - 2
+      - 2
+      num_filters:
+      - 64
+      - 128
+      - 256
+      upsample_strides:
+      - 1
+      - 2
+      - 4
+      num_upsample_filter:
+      - 128
+      - 128
+      - 128
+    shrink_header:
+      kernal_size:
+      - 3
+      stride:
+      - 1
+      padding:
+      - 1
+      dim:
+      - 256
+      input_dim: 384
+    fusion_method: cobevt
+    cobevt:
+      input_dim: 256
+      mlp_dim: 256
+      agent_size: 2
+      window_size: 4
+      dim_head: 32
+      drop_out: 0.1
+      depth: 3
+    domain_adapter:
+      enabled: false
+      method: none
+      hidden_dim: 128
+      feature_size:
+      - 48
+      - 176
+      dusa_lsa_hidden_dim: 1024
+      dusa_cia_hidden_dim: 512
+      lsa_grl_scale: 0.05
+      cia_grl_scale: 0.1
+      iada_hidden_dim: 64
+      iada_effect_dim: 64
+      iada_gate_limit: 0.25
+      iada_domain_hidden_dim: 64
+      iada_local_topk: 512
+      iada_source_supervision_enabled: true
+      iada_target_consistency_enabled: false
+      iada_effect_memory_enabled: false
+      iada_consistency_dropout: 0.1
+      iada_teacher_momentum: 0.999
+      iada_prototype_momentum: 0.99
+      geometry_scale: 100.0
+      cudax_hidden_dim: 256
+      ckt_groups: 8
+      ckt_shuffle_groups: 2
+      cudax_bin_count: 5
+      cpa_hidden_dim: 1024
+      ssda_hidden_dim: 128
+      sao_enabled: true
+      sao_probability: 1.0
+      fsa_epsilon: 1.0e-05
+      ssda_detach_attention: false
+    dir_args:
+      dir_offset: 0.7853
+      num_bins: 2
+      anchor_yaw: *id002
+loss:
+  core_method: point_pillar_loss
+  args:
+    pos_cls_weight: 2.0
+    cls:
+      type: SigmoidFocalLoss
+      alpha: 0.25
+      gamma: 2.0
+      weight: 2.0
+    reg:
+      type: WeightedSmoothL1Loss
+      sigma: 3.0
+      codewise: true
+      weight: 2.0
+    dir:
+      type: WeightedSoftmaxClassificationLoss
+      weight: 0.2
+      args:
+        dir_offset: 0.7853
+        num_bins: 2
+        anchor_yaw:
+        - 0
+        - 90
+optimizer:
+  core_method: Adam
+  lr: 0.001
+  args:
+    eps: 1.0e-10
+    weight_decay: 0.0001
+lr_scheduler:
+  core_method: multistep
+  gamma: 0.1
+  step_size:
+  - 10
+  - 15
+domain_adaptation:
+  stage: baseline
+  mode: source_only
+  seed: 303
+  source:
+    root_dir: /home/caoyitong/DataProjects/v2x_datasets/OPV2V/train
+    validate_dir: /home/caoyitong/DataProjects/v2x_datasets/OPV2V/validate
+    test_dir: /home/caoyitong/DataProjects/v2x_datasets/OPV2V/test
+    fusion:
+      dataset: opv2v
+  source_batch_size: 2
+  target_batch_size: 2
+  num_workers: 8
+  steps_per_epoch: null
+  log_freq: 10
+  domain_loss_weight: 0.1
+  dusa_lsa_weight: 1.0
+  dusa_cia_weight: 1.0
+  cudax_bin_loss_weight: 0.1
+  cudax_domain_loss_weight: 0.1
+  iada_safe_weight: 0.05
+  iada_correction_weight: 0.0
+  iada_utility_weight: 0.0
+  iada_consistency_weight: 0.0
+  iada_effect_weight: 0.0
+  iada_global_domain_weight: 0.05
+  iada_local_domain_weight: 0.05
+  iada_gate_identity_weight: 0.1
+  iada_effect_variance_weight: 0.01
+  iada_effect_target_std: 0.05
+  iada_source_adapter_only: true
+  iada_target_adapter_only: true
+  iada_safe_margin: 0.0
+  iada_target_confidence_threshold: 0.6
+  iada_target_advantage_threshold: 0.03
+  iada_discovery_ego_threshold: 0.5
+  iada_refinement_error_threshold: 0.1
+  iada_prototype_momentum: 0.99
+  ssda_global_weight: 0.5
+  ssda_local_weight: 1.0
+  cudax_bin_count: 5
+  cudax_residual_bounds:
+  - 0.466593469
+  - 0.474283659
+  - 0.84739182
+  - 0.187087912
+  - 0.337236804
+  - 0.317517082
+  pretrained_lr_scale: 0.1
+  adapter_lr_scale: 1.0
+  graph_variance_weight: 0.0
+  graph_variance_target_std: 0.0
+  gradient_clip_norm: 10.0
+  grl:
+    max_value: 1.0
+    gamma: 10.0
+  pretrained_model_dir: ''
+  target_agent_type: v2v
+  source_drop_keys:
+  - sample_offset

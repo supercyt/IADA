@@ -192,6 +192,7 @@ class OPV2VBaseDataset(Dataset):
             The dictionary contains loaded yaml params and lidar data for
             each cav.
         """
+        idx += int(self.params.get('sample_offset', 0))
         # we loop the accumulated length list to see get the scenario index
         scenario_index = 0
         for i, ele in enumerate(self.len_record):
@@ -262,7 +263,15 @@ class OPV2VBaseDataset(Dataset):
         return data
 
     def __len__(self):
-        return self.len_record[-1]
+        length = self.len_record[-1] - int(
+            self.params.get('sample_offset', 0)
+        )
+        if length < 0:
+            raise ValueError('sample_offset exceeds dataset length')
+        max_samples = self.params.get('max_samples')
+        if max_samples is not None:
+            length = min(length, int(max_samples))
+        return length
 
     def __getitem__(self, idx):
         """
