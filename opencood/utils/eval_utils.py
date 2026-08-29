@@ -152,10 +152,10 @@ def eval_final_results(result_stat, save_path, infer_info=None):
     dump_dict.update({'ap30': ap_30,
                       'ap_50': ap_50,
                       'ap_70': ap_70,
-                      'mpre_50': mpre_50,
-                      'mrec_50': mrec_50,
-                      'mpre_70': mpre_70,
-                      'mrec_70': mrec_70,
+                      #'mpre_50': mpre_50,
+                      #'mrec_50': mrec_50,
+                      #'mpre_70': mpre_70,
+                      #'mrec_70': mrec_70,
                       })
     if infer_info is None:
         yaml_utils.save_yaml(dump_dict, os.path.join(save_path, 'eval.yaml'))
