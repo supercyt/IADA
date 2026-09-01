@@ -1,12 +1,12 @@
 name: opv2v_to_v2v4real_pointpillar_cobevt_da
 data_dir: null
-root_dir: /home/caoyitong/DataProjects/v2x_datasets/V2V4Real/train
-validate_dir: /home/caoyitong/DataProjects/v2x_datasets/V2V4Real/val
-test_dir: /home/caoyitong/DataProjects/v2x_datasets/V2V4Real/test
+root_dir: /mnt/sda/caoyitong/V2V4Real/train
+validate_dir: /mnt/sda/caoyitong/V2V4Real/val
+test_dir: /mnt/sda/caoyitong/V2V4Real/test
 yaml_parser: load_point_pillar_params
 train_params:
-  batch_size: 2
-  epoches: 30
+  batch_size: 4
+  epoches: 20
   eval_freq: 2
   save_freq: 2
   max_cav: 2
@@ -208,13 +208,13 @@ domain_adaptation:
   mode: source_only
   seed: 303
   source:
-    root_dir: /home/caoyitong/DataProjects/v2x_datasets/OPV2V/train
-    validate_dir: /home/caoyitong/DataProjects/v2x_datasets/OPV2V/validate
-    test_dir: /home/caoyitong/DataProjects/v2x_datasets/OPV2V/test
+    root_dir: /mnt/sdb/caoyitong/v2x_datasets/OPV2V/train
+    validate_dir: /mnt/sdb/caoyitong/v2x_datasets/OPV2V/validate
+    test_dir: /mnt/sdb/caoyitong/v2x_datasets/OPV2V/test
     fusion:
       dataset: opv2v
-  source_batch_size: 2
-  target_batch_size: 2
+  source_batch_size: 4
+  target_batch_size: 4
   num_workers: 8
   steps_per_epoch: null
   log_freq: 10

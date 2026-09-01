@@ -1,6 +1,4 @@
-name: opv2v_to_dairv2x_pointpillar_cobevt_ssda_lowres
-
-# Dedicated low-resolution SSDA config. Keep the shared CoBEVT config unchanged.
+name: opv2v_to_dairv2x_pointpillar_cobevt_da
 
 # Target-centric top level so saved runs can use the DAIR-V2X inference path.
 data_dir: "/mnt/sdb/caoyitong/v2x_datasets/my_dair_v2x/v2x_c/cooperative-vehicle-infrastructure"
@@ -11,8 +9,8 @@ test_dir: "/mnt/sdb/caoyitong/v2x_datasets/my_dair_v2x/v2x_c/cooperative-vehicle
 yaml_parser: "load_point_pillar_params"
 
 train_params:
-  batch_size: 1
-  epoches: 25
+  batch_size: 2
+  epoches: 40
   eval_freq: 2
   save_freq: 2
   max_cav: 2
@@ -62,7 +60,7 @@ postprocess:
     w: 2.0
     h: 1.56
     r: &anchor_yaw [0, 90]
-    feature_stride: 4
+    feature_stride: 2
     num: &anchor_num 2
   target_args:
     pos_threshold: 0.6
@@ -105,7 +103,7 @@ model:
     # blocks and the domain adapter operate on 256 channels.
     shrink_header:
       kernal_size: [3]
-      stride: [2]
+      stride: [1]
       padding: [1]
       dim: [256]
       input_dim: 384
@@ -116,18 +114,18 @@ model:
       mlp_dim: 256
       # Must equal train_params.max_cav and the pairwise matrix agent axis.
       agent_size: 2
-      # The SSDA feature map is 50 x 126; both axes are divisible by two.
-      window_size: 2
+      # Both 100 and 252 are divisible by four.
+      window_size: 4
       dim_head: 32
       drop_out: 0.1
       depth: 3
 
     domain_adapter:
       # train_iada.py overwrites enabled/method from --stage.
-      enabled: true
-      method: ssda
+      enabled: false
+      method: none
       hidden_dim: 128
-      feature_size: [50, 126]
+      feature_size: [100, 252]
       dusa_lsa_hidden_dim: 1024
       dusa_cia_hidden_dim: 512
       lsa_grl_scale: 0.05
@@ -149,11 +147,11 @@ model:
       ckt_shuffle_groups: 2
       cudax_bin_count: 5
       cpa_hidden_dim: 1024
-      ssda_hidden_dim: 32
+      ssda_hidden_dim: 128
       sao_enabled: true
       sao_probability: 1.0
       fsa_epsilon: 0.00001
-      ssda_detach_attention: true
+      ssda_detach_attention: false
 
     dir_args: *dir_args
 
@@ -186,11 +184,11 @@ optimizer:
 lr_scheduler:
   core_method: multistep
   gamma: 0.1
-  step_size: [10, 15]
+  step_size: [10, 20, 30]
 
 domain_adaptation:
-  stage: ssda
-  mode: uda
+  stage: baseline
+  mode: source_only
   seed: 303
   source:
     root_dir: "/mnt/sdb/caoyitong/v2x_datasets/OPV2V/train"
@@ -199,9 +197,9 @@ domain_adaptation:
     fusion:
       dataset: 'opv2v'
 
-  source_batch_size: 1
-  target_batch_size: 1
-  num_workers: 8
+  source_batch_size: 2
+  target_batch_size: 2
+  num_workers: 4
   steps_per_epoch: null
   log_freq: 10
   domain_loss_weight: 0.1

@@ -63,7 +63,7 @@ postprocess:
     neg_threshold: 0.45
     score_threshold: 0.2
   order: hwl
-  max_num: 32
+  max_num: 100
   nms_thresh: 0.15
   dir_args:
     dir_offset: 0.7853

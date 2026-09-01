@@ -3,10 +3,10 @@ base_config: pointpillar_cobevt_iada.yaml
 model:
   args:
     domain_adapter:
-      iada_local_topk: 256
+      iada_local_topk: 512
 
 train_params:
-  epoches: 15
+  epoches: 20
   eval_freq: 1
   save_freq: 1
 

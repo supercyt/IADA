@@ -1,12 +1,12 @@
 name: opv2v_to_zut_pointpillar_cobevt_da
 data_dir: null
-root_dir: /home/caoyitong/DataProjects/v2x_datasets/ZUT_OPV2V/train
-validate_dir: /home/caoyitong/DataProjects/v2x_datasets/ZUT_OPV2V/validate
-test_dir: /home/caoyitong/DataProjects/v2x_datasets/ZUT_OPV2V/test
+root_dir: /mnt/sda/caoyitong/ZUT_OPV2V/train
+validate_dir: /mnt/sda/caoyitong/ZUT_OPV2V/validate
+test_dir: /mnt/sda/caoyitong/ZUT_OPV2V/test
 yaml_parser: load_point_pillar_params
 train_params:
-  batch_size: 4
-  epoches: 30
+  batch_size: 8
+  epoches: 20
   eval_freq: 2
   save_freq: 2
   max_cav: 2
@@ -63,7 +63,7 @@ postprocess:
     neg_threshold: 0.45
     score_threshold: 0.2
   order: hwl
-  max_num: 32
+  max_num: 100
   nms_thresh: 0.15
   dir_args:
     dir_offset: 0.7853
@@ -202,14 +202,14 @@ domain_adaptation:
   mode: source_only
   seed: 303
   source:
-    root_dir: /home/caoyitong/DataProjects/v2x_datasets/OPV2V/train
-    validate_dir: /home/caoyitong/DataProjects/v2x_datasets/OPV2V/validate
-    test_dir: /home/caoyitong/DataProjects/v2x_datasets/OPV2V/test
+    root_dir: /mnt/sdb/caoyitong/v2x_datasets/OPV2V/train
+    validate_dir: /mnt/sdb/caoyitong/v2x_datasets/OPV2V/validate
+    test_dir: /mnt/sdb/caoyitong/v2x_datasets/OPV2V/test
     fusion:
       dataset: opv2v
-  source_batch_size: 4
-  target_batch_size: 4
-  num_workers: 8
+  source_batch_size: 8
+  target_batch_size: 8
+  num_workers: 16
   steps_per_epoch: null
   log_freq: 10
   domain_loss_weight: 0.1

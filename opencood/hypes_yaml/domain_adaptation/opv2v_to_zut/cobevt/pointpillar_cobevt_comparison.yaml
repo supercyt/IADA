@@ -2,10 +2,10 @@ base_config: pointpillar_cobevt_iada.yaml
 
 # Keep adaptation baselines on the same 15-epoch schedule as IADA.
 name: opv2v_to_zut_pointpillar_cobevt_comparison
-train_params:
-  epoches: 15
-  eval_freq: 1
-  save_freq: 1
+#train_params:
+#  epoches: 15
+#  eval_freq: 1
+#  save_freq: 1
 
 model:
   args:

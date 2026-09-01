@@ -10,7 +10,7 @@ yaml_parser: "load_point_pillar_params"
 
 train_params:
   batch_size: 4
-  epoches: 25
+  epoches: 40
   eval_freq: 2
   save_freq: 2
   max_cav: 2
@@ -184,7 +184,7 @@ optimizer:
 lr_scheduler:
   core_method: multistep
   gamma: 0.1
-  step_size: [10, 15]
+  step_size: [10, 20, 30]
 
 domain_adaptation:
   stage: baseline

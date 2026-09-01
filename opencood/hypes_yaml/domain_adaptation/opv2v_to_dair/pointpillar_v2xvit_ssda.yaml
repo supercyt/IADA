@@ -1,6 +1,4 @@
-name: opv2v_to_dairv2x_pointpillar_v2xvit_ssda_lowres
-
-# Dedicated low-resolution SSDA config. Keep the shared V2X-ViT config unchanged.
+name: opv2v_to_dairv2x_pointpillar_v2xvit_da
 
 # Target-centric top level: saved checkpoints can be evaluated directly by
 # the existing DAIR-V2X inference entry point.
@@ -12,7 +10,7 @@ test_dir: "/mnt/sdb/caoyitong/v2x_datasets/my_dair_v2x/v2x_c/cooperative-vehicle
 yaml_parser: "load_point_pillar_params"
 
 train_params:
-  batch_size: 1
+  batch_size: 2
   epoches: 60
   eval_freq: 2
   save_freq: 2
@@ -62,7 +60,7 @@ postprocess:
     w: 2.0
     h: 1.56
     r: &anchor_yaw [0, 90]
-    feature_stride: 4
+    feature_stride: 2
     num: &anchor_num 2
   target_args:
     pos_threshold: 0.6
@@ -103,8 +101,10 @@ model:
 
     shrink_header:
       kernal_size: [3]
-      # Downsample only this SSDA model to a 50 x 126 fusion grid.
-      stride: [2]
+      # Preserve the common 100 x 252 comparison grid. V2X-ViT's window
+      # attention has no internal padding, so its windows below must divide
+      # both spatial dimensions exactly.
+      stride: [1]
       padding: [1]
       dim: [256]
       input_dim: 384
@@ -134,8 +134,7 @@ model:
             heads: [16, 8, 4]
             dim_head: [16, 32, 64]
             dropout: 0.3
-            # 50 x 126 is divisible by one and two, but not four.
-            window_size: [1, 2, 2]
+            window_size: [1, 2, 4]
             relative_pos_embedding: true
             fusion_method: 'split_attn'
           feed_forward:
@@ -146,10 +145,10 @@ model:
             downsample_rate: 2
 
     domain_adapter:
-      enabled: true
-      method: ssda
+      enabled: false
+      method: none
       hidden_dim: 128
-      feature_size: [50, 126]
+      feature_size: [100, 252]
       dusa_lsa_hidden_dim: 1024
       dusa_cia_hidden_dim: 512
       lsa_grl_scale: 0.05
@@ -173,11 +172,6 @@ model:
       ckt_shuffle_groups: 2
       cudax_bin_count: 5
       cpa_hidden_dim: 1024
-      ssda_hidden_dim: 32
-      sao_enabled: true
-      sao_probability: 1.0
-      fsa_epsilon: 0.00001
-      ssda_detach_attention: true
 
     dir_args: *dir_args
 
@@ -213,8 +207,8 @@ lr_scheduler:
   step_size: [10, 50]
 
 domain_adaptation:
-  stage: ssda
-  mode: uda
+  stage: baseline
+  mode: source_only
   seed: 303
   source:
     root_dir: "/mnt/sdb/caoyitong/v2x_datasets/OPV2V/train"
@@ -223,8 +217,8 @@ domain_adaptation:
     fusion:
       dataset: 'opv2v'
 
-  source_batch_size: 1
-  target_batch_size: 1
+  source_batch_size: 2
+  target_batch_size: 2
   num_workers: 4
   steps_per_epoch: null
   log_freq: 10

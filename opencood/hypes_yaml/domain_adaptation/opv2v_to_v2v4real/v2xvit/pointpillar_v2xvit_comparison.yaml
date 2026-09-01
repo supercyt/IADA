@@ -3,9 +3,9 @@ base_config: pointpillar_v2xvit_iada.yaml
 # Keep adaptation baselines on the same 15-epoch schedule as IADA.
 name: opv2v_to_v2v4real_pointpillar_v2xvit_comparison
 train_params:
-  epoches: 15
-  eval_freq: 1
-  save_freq: 1
+  epoches: 20
+  eval_freq: 2
+  save_freq: 2
 
 model:
   args:
