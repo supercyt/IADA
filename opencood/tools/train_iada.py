@@ -1233,23 +1233,6 @@ def main():
     best_validation_path = _resolve_best_validation_path(
         saved_path, resume_state
     )
-    if (
-        resume_state is None
-        and not opt.model_dir
-        and stage != "baseline"
-        and initialization == "baseline_warm_start"
-    ):
-        best_validation_loss = _validate_source(
-            model, criterion, source_validate_loader, device
-        )
-        best_validation_path = os.path.join(
-            saved_path, "net_epoch_bestval_at0.pth"
-        )
-        _atomic_torch_save(model.state_dict(), best_validation_path)
-        print(
-            "Warm-start reference before adaptation: source validation loss "
-            f"{best_validation_loss:.4f}"
-        )
     if legacy_resume and best_validation_path is not None:
         _load_model_checkpoint(
             model,
